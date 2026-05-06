@@ -1,0 +1,12 @@
+﻿streamlit
+pandas
+databricks-sdk
+plotly
+groq
+statsmodels
+yfinance
+vaderSentiment
+beautifulsoup4
+python-dotenv
+scikit-learn
+pyarrow

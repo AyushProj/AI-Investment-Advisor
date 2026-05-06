@@ -1,0 +1,5 @@
+# Optional: FinBERT headline sentiment on home / company views (~440MB download).
+# Install in addition to requirements.txt when you want ML sentiment beyond VADER:
+#   pip install -r requirements.txt -r requirements-ml.txt
+transformers
+torch

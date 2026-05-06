@@ -1,0 +1,17 @@
+command: [
+  "streamlit",
+  "run",
+  "app.py"
+]
+# Set real values in the Databricks Apps UI (do not commit secrets):
+#   GROQ_API_KEY — Groq API key (LLM).
+#   INVESTIQ_SQL_WAREHOUSE_ID or DATABRICKS_SQL_WAREHOUSE_ID — SQL warehouse id.
+#   INVESTIQ_STOCK_NEWS_FQN — optional; default investiq.stock_news.
+# Grant the app identity USE on the warehouse and SELECT on
+# team_tech_innovators.default.* and the news view.
+env:
+  - name: GROQ_API_KEY
+    value: ""
+  # Optional: override the default Groq model
+  # - name: GROQ_MODEL
+  #   value: "llama3-70b-8192"
