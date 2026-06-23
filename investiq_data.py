@@ -61,11 +61,11 @@ DEFAULT_TICKERS: list[str] = [
 # Retry logic with exponential backoff
 # ---------------------------------------------------------------------------
 
-def _retry_with_backoff(func, symbol: str, max_retries: int = 3, initial_delay: float = 0.5) -> dict | pd.DataFrame:
-    """Retry a function with exponential backoff for rate limiting."""
+def _retry_with_backoff(func, max_retries: int = 3, initial_delay: float = 0.5, default=None):
+    """Retry a zero-arg callable with exponential backoff for rate limiting."""
     for attempt in range(max_retries):
         try:
-            return func(symbol)
+            return func()
         except Exception as exc:
             if "Too Many Requests" in str(exc) or "429" in str(exc):
                 if attempt < max_retries - 1:
@@ -73,8 +73,8 @@ def _retry_with_backoff(func, symbol: str, max_retries: int = 3, initial_delay: 
                     time.sleep(delay)
                     continue
             # Last attempt failed or non-retryable error
-            return {} if isinstance(func(symbol), dict) else pd.DataFrame()
-    return {} if isinstance(func(symbol), dict) else pd.DataFrame()
+            return default if default is not None else {}
+    return default if default is not None else {}
 
 
 # ---------------------------------------------------------------------------
@@ -89,7 +89,7 @@ def _fetch_ticker_info(symbol: str) -> dict:
         return ticker.info or {}
     
     try:
-        return _retry_with_backoff(fetch, symbol)
+        return _retry_with_backoff(fetch, default={})
     except Exception as exc:
         st.warning(f"Could not fetch info for {symbol}: {exc}")
         return {}
