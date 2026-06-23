@@ -21,96 +21,64 @@ from price_forecast_ml import (
     run_rf_regression,      # Item 4
     get_sentiment_score,    # Item 2
 )
-from investiq_data import SQL_WAREHOUSE_ID, _tbl
 from llm_chat import chat_completion, get_gemini_api_key, get_gemini_model
-from databricks.sdk import WorkspaceClient
-from databricks.sdk.service.sql import StatementState
-import time
+import yfinance as yf
 
 st.set_page_config(page_title="Company Details", page_icon="📊", layout="wide")
 
-WAREHOUSE_ID = SQL_WAREHOUSE_ID
-CHUNK_SIZE = 1000
 
-
-def _run_query(w: WorkspaceClient, sql: str, label: str) -> pd.DataFrame:
-    all_rows = []
-    columns = None
-    offset = 0
+@st.cache_data(ttl=300)
+def _fetch_ticker_info(symbol: str) -> dict:
+    """Fetch ticker info from yfinance."""
     try:
-        while True:
-            paginated_sql = f"SELECT * FROM ({sql}) _q LIMIT {CHUNK_SIZE} OFFSET {offset}"
-            resp = w.statement_execution.execute_statement(
-                warehouse_id=WAREHOUSE_ID, statement=paginated_sql, wait_timeout="30s",
-            )
-            while resp.status.state in [StatementState.PENDING, StatementState.RUNNING]:
-                time.sleep(1)
-                resp = w.statement_execution.get_statement(resp.statement_id)
-            if resp.status.state != StatementState.SUCCEEDED:
-                st.error(f"Query '{label}' failed: {getattr(resp.status, 'error', 'unknown')}")
-                break
-            if columns is None:
-                schema = None
-                if resp.manifest is not None and hasattr(resp.manifest, "schema") and resp.manifest.schema is not None:
-                    schema = resp.manifest.schema
-                elif hasattr(resp.result, "schema") and resp.result.schema is not None:
-                    schema = resp.result.schema
-                if schema is None:
-                    st.error(f"Query '{label}': could not locate schema.")
-                    return pd.DataFrame()
-                columns = [c.name for c in schema.columns]
-            if resp.result is None or not resp.result.data_array:
-                break
-            chunk = resp.result.data_array
-            all_rows.extend(chunk)
-            if len(chunk) < CHUNK_SIZE:
-                break
-            offset += CHUNK_SIZE
-        if not all_rows:
-            return pd.DataFrame(columns=columns) if columns else pd.DataFrame()
-        return pd.DataFrame(all_rows, columns=columns)
-    except Exception as exc:
-        st.error(f"Exception running query '{label}': {exc}")
+        ticker = yf.Ticker(symbol)
+        return ticker.info or {}
+    except Exception:
+        return {}
+
+
+@st.cache_data(ttl=300)
+def _fetch_price_history(symbol: str, period: str = "5y") -> pd.DataFrame:
+    """Fetch historical price data from yfinance."""
+    try:
+        ticker = yf.Ticker(symbol)
+        hist = ticker.history(period=period, auto_adjust=True)
+        if hist.empty:
+            return pd.DataFrame()
+        hist.index = pd.to_datetime(hist.index).normalize()
+        hist = hist.reset_index()
+        hist.columns = [c.lower() for c in hist.columns]
+        hist = hist.rename(columns={"date": "report_date"})
+        return hist
+    except Exception:
         return pd.DataFrame()
 
 
-@st.cache_data
+@st.cache_data(ttl=300)
 def load_company_prices(symbol: str) -> pd.DataFrame:
-    w = WorkspaceClient()
-    query = f"""
-        SELECT symbol, report_date, open, close, high, low, volume
-        FROM {_tbl('stock_prices')}
-        WHERE UPPER(TRIM(symbol)) = '{symbol}'
-        ORDER BY report_date
-    """
-    df = _run_query(w, query, f"prices_{symbol}")
+    """Load historical price data for a company."""
+    df = _fetch_price_history(symbol, period="5y")
     if df.empty:
         return pd.DataFrame()
+    df["symbol"] = symbol.upper()
     df["report_date"] = pd.to_datetime(df["report_date"], errors="coerce")
     for col in ["open", "close", "high", "low", "volume"]:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
     df = df.dropna(subset=["report_date", "close"])
-    return df.sort_values("report_date").reset_index(drop=True)
+    return df[["symbol", "report_date", "open", "close", "high", "low", "volume"]].sort_values("report_date").reset_index(drop=True)
 
 
-@st.cache_data
+@st.cache_data(ttl=600)
 def load_company_profile(symbol: str) -> dict | None:
-    w = WorkspaceClient()
-    query = f"""
-        SELECT symbol, sector, industry, long_business_summary
-        FROM {_tbl('stock_profile')}
-        WHERE UPPER(TRIM(symbol)) = '{symbol}'
-        ORDER BY report_date DESC
-        LIMIT 1
-    """
-    df = _run_query(w, query, f"profile_{symbol}")
-    if df.empty:
+    """Load company profile info from yfinance."""
+    info = _fetch_ticker_info(symbol)
+    if not info:
         return None
-    row = df.iloc[0]
     return {
-        "sector":   row.get("sector", ""),
-        "industry": row.get("industry", ""),
-        "summary":  row.get("long_business_summary", ""),
+        "sector":   info.get("sector", "N/A"),
+        "industry": info.get("industry", "N/A"),
+        "summary":  info.get("longBusinessSummary", "No summary available."),
     }
 
 

@@ -1,6 +1,5 @@
 ﻿streamlit
 pandas
-databricks-sdk
 plotly
 groq
 statsmodels

@@ -14,7 +14,7 @@ try:
 except ImportError:
     pass
 
-from investiq_data import is_databricks_auth_failure, load_screener_stocks
+from investiq_data import load_screener_stocks
 
 st.set_page_config(
     page_title="Stock Screener — InvestIQ",
@@ -214,11 +214,11 @@ render_navbar(current="screener")
 st.markdown(
     """
     <div class="sc-hero">
-        <div class="sc-badge">● Databricks SQL warehouse</div>
+        <div class="sc-badge">● Market Data</div>
         <div class="sc-title">Stock screener</div>
         <div class="sc-sub">
             Filter stocks by sector, price, momentum trend, EPS, dividends,
-            volatility and revenue growth — all pulled live from Databricks.
+            volatility and revenue growth — all pulled live from market data.
         </div>
     </div>
     """,
@@ -231,21 +231,16 @@ def _load() -> pd.DataFrame:
     return load_screener_stocks()
 
 
-with st.spinner("Loading stocks from Databricks…"):
+with st.spinner("Loading stocks…"):
     try:
         df_all = _load()
     except Exception as exc:
-        if is_databricks_auth_failure(exc):
-            st.error("Databricks authentication failed.")
-            st.markdown(
-                "Use `DATABRICKS_HOST` + OAuth (`DATABRICKS_CLIENT_*`) or "
-                "`DATABRICKS_CONFIG_PROFILE` after `databricks auth login`."
-            )
-            st.stop()
-        raise
+        st.error(f"Error loading stocks: {exc}")
+        st.info("Please ensure you have a stable internet connection for data fetching.")
+        st.stop()
 
 if df_all.empty:
-    st.info("No stock data returned from Databricks.")
+    st.info("No stock data available.")
     st.stop()
 
 # ── Normalise column types ─────────────────────────────────────────────────

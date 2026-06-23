@@ -187,7 +187,6 @@ def _sectors_column_config() -> dict:
     }
 
 from investiq_data import (
-    is_databricks_auth_failure,
     load_recent_dividend_events,
     load_recent_sec_filings,
     load_sector_benchmarks,
@@ -304,7 +303,7 @@ render_navbar(current="marketiq")
 st.markdown(
     """
     <div class="mi-hero">
-        <div class="mi-badge">● Databricks SQL warehouse</div>
+        <div class="mi-badge">● Market Data</div>
         <div class="mi-title">Market intelligence</div>
     </div>
     """,
@@ -324,14 +323,9 @@ try:
     with st.spinner("Loading revenue highlights…"):
         revenue = load_statement_highlights(25)
 except Exception as exc:
-    if is_databricks_auth_failure(exc):
-        st.error("Databricks authentication failed.")
-        st.markdown(
-            "If you use the CLI, run `databricks auth login` again (add `--profile …` "
-            "if your error mentioned one). Or set `DATABRICKS_HOST` + `DATABRICKS_TOKEN`."
-        )
-        st.stop()
-    raise
+    st.error(f"Error loading market data: {exc}")
+    st.info("Please ensure you have a stable internet connection for data fetching.")
+    st.stop()
 
 tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
     "Sectors",

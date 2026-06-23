@@ -27,10 +27,9 @@ except ImportError:
     pass
 
 from investiq_data import (
-    is_databricks_auth_failure,
     load_price_history,
     load_price_snapshot,
-    run_sql_query,
+    load_homepage_data,
 )
 
 # ── Page config ───────────────────────────────────────────────────────────────
@@ -225,32 +224,14 @@ def _snapshot() -> pd.DataFrame:
 
 @st.cache_data(ttl=600, show_spinner=False)
 def _universe() -> pd.DataFrame:
-    df = run_sql_query(
-        """
-        WITH names AS (
-            SELECT symbol, company_name FROM (
-                SELECT symbol, company_name,
-                    ROW_NUMBER() OVER (PARTITION BY symbol ORDER BY filing_date DESC) AS rn
-                FROM team_tech_innovators.default.stock_sec_filing
-            ) t WHERE rn = 1
-        ),
-        syms AS (
-            SELECT DISTINCT symbol
-            FROM team_tech_innovators.default.stock_prices
-        )
-        SELECT s.symbol,
-               COALESCE(n.company_name, s.symbol) AS company_name
-        FROM syms s
-        LEFT JOIN names n ON s.symbol = n.symbol
-        ORDER BY s.symbol
-        """,
-        "universe",
-    )
+    """Load stock universe from yfinance via investiq_data."""
+    df = load_homepage_data()
     if df.empty:
         return pd.DataFrame(columns=["symbol", "company_name"])
-    df["symbol"]       = df["symbol"].astype(str).str.upper().str.strip()
-    df["company_name"] = df["company_name"].astype(str).str.strip()
-    return df.drop_duplicates("symbol").reset_index(drop=True)
+    # Ensure we have the columns we need
+    if "company_name" not in df.columns:
+        df["company_name"] = df.get("symbol", df.index)
+    return df[["symbol", "company_name"]].drop_duplicates("symbol").reset_index(drop=True)
 
 
 def get_latest_price(symbol: str) -> tuple[float, str]:
@@ -533,17 +514,12 @@ st.markdown(
 try:
     universe_df = _universe()
 except Exception as exc:
-    if is_databricks_auth_failure(exc):
-        st.error("Databricks authentication failed.")
-        st.markdown(
-            "Configure `DATABRICKS_HOST` with OAuth or `DATABRICKS_CONFIG_PROFILE` "
-            "after `databricks auth login`."
-        )
-        st.stop()
-    raise
+    st.error(f"Error loading stock universe: {exc}")
+    st.info("Please ensure you have a stable internet connection for data fetching.")
+    st.stop()
 
 if universe_df.empty:
-    st.error("Could not load stock universe from Databricks. Check your connection.")
+    st.error("Could not load stock universe. Check your connection.")
     st.stop()
 
 search_options: list[str] = [
@@ -758,11 +734,11 @@ if portfolio:
                     except Exception:
                         sentiment_map[sym] = {"score": 0.0, "label": "Neutral", "count": 0}
 
-        with st.spinner("Loading historical prices from Databricks…"):
+        with st.spinner("Loading historical prices…"):
             hist = load_price_history(tuple(symbols), lookback_needed)
 
         if hist.empty:
-            st.error("No historical price data returned from Databricks.")
+            st.error("No historical price data available.")
             st.stop()
 
         hist["report_date"] = pd.to_datetime(hist["report_date"], errors="coerce")

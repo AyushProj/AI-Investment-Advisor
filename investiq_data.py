@@ -1,38 +1,29 @@
 """
-InvestIQ data layer.
+InvestIQ data layer – Streamlit + yfinance.
 
-Two-phase design
-----------------
-1. INGEST  – pull live data from yfinance and WRITE it into Databricks Delta
-             tables under `team_tech_innovators.default.*`.
-             Call `ingest_tickers(symbols)` once (e.g. from a notebook or a
-             Databricks Job) before running the Streamlit app.
+Single-phase design
+-------------------
+All data is fetched directly from yfinance on demand and cached with 
+Streamlit's @st.cache_data decorator. No Databricks or external databases 
+required. Perfect for direct Streamlit hosting.
 
-2. READ    – the Streamlit pages call the `load_*` helpers which run SQL
-             against those same Delta tables via the Statement Execution API.
-             No yfinance calls happen at Streamlit runtime.
-
-Tables created / overwritten by ingest
----------------------------------------
-  stock_profile          – sector, industry, business summary
-  stock_prices           – daily OHLCV
-  stock_sec_filing       – company name + a synthetic "filing_date"
-  stock_dividend_events  – historical dividends
-  stock_tailing_eps      – trailing EPS snapshot
-  stock_statement        – annual income-statement revenue rows
+Features
+--------
+  - Direct yfinance integration for real-time market data
+  - Streamlit caching for performance (300-900s TTL)
+  - Profile, prices, dividends, EPS, and financial statements
+  - Works offline with cached data from last fetch
 """
 
 from __future__ import annotations
 
 import os
-import time
 from pathlib import Path
 from typing import Optional
 
 import pandas as pd
 import streamlit as st
-from databricks.sdk import WorkspaceClient
-from databricks.sdk.service.sql import StatementState
+import yfinance as yf
 
 try:
     from dotenv import load_dotenv
@@ -41,56 +32,15 @@ try:
 except ImportError:
     pass
 
-
-def _normalize_databricks_env_vars() -> None:
-    """Normalize Databricks auth env (whitespace, host scheme, CLI vs OAuth)."""
-    for key in (
-        "DATABRICKS_HOST",
-        "DATABRICKS_CLIENT_ID",
-        "DATABRICKS_CLIENT_SECRET",
-        "DATABRICKS_TOKEN",
-        "DATABRICKS_CONFIG_PROFILE",
-    ):
-        v = os.environ.get(key)
-        if v is not None:
-            s = v.strip()
-            if s != v:
-                os.environ[key] = s
-
-    host = os.environ.get("DATABRICKS_HOST", "").strip()
-    if host and not host.lower().startswith(("http://", "https://")):
-        os.environ["DATABRICKS_HOST"] = f"https://{host.lstrip('/')}"
-
-    profile = os.environ.get("DATABRICKS_CONFIG_PROFILE", "").strip()
-    cid = os.environ.get("DATABRICKS_CLIENT_ID", "").strip()
-    secret = os.environ.get("DATABRICKS_CLIENT_SECRET", "").strip()
-
-    # If CLI profile is set but OAuth secret is missing, drop incomplete OAuth
-    # vars so the SDK uses the profile (local dev). Databricks Apps always
-    # injects a non-empty secret.
-    if profile and cid and not secret:
-        del os.environ["DATABRICKS_CLIENT_ID"]
-        if "DATABRICKS_CLIENT_SECRET" in os.environ:
-            del os.environ["DATABRICKS_CLIENT_SECRET"]
-
-
-_normalize_databricks_env_vars()
-
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
 
-SQL_WAREHOUSE_ID = (
-    os.getenv("INVESTIQ_SQL_WAREHOUSE_ID", "").strip()
-    or os.getenv("DATABRICKS_SQL_WAREHOUSE_ID", "").strip()
-    or "15254d4da5befaaa"
-)
-CATALOG = "team_tech_innovators"
-SCHEMA = "default"
-CHUNK_SIZE = 1000
+CACHE_TTL_SHORT = 300    # 5 minutes
+CACHE_TTL_MEDIUM = 600   # 10 minutes
+CACHE_TTL_LONG = 900     # 15 minutes
 
-# Default ticker universe (S&P-100 sample).  Override by passing your own
-# list to ingest_tickers().
+# Default ticker universe (S&P-100 sample)
 DEFAULT_TICKERS: list[str] = [
     "AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "META", "TSLA", "BRK-B",
     "JPM", "V", "UNH", "XOM", "JNJ", "WMT", "MA", "PG", "LLY", "CVX",
@@ -107,750 +57,246 @@ DEFAULT_TICKERS: list[str] = [
 
 
 # ---------------------------------------------------------------------------
-# Internal SQL helper
+# Data Fetching – Direct yfinance API
 # ---------------------------------------------------------------------------
 
-def get_sql_warehouse_id() -> str:
-    return SQL_WAREHOUSE_ID
-
-
-def is_databricks_auth_failure(exc: BaseException) -> bool:
-    """True when ``WorkspaceClient`` cannot authenticate (missing or stale creds)."""
-    err = str(exc).lower()
-    return any(
-        phrase in err
-        for phrase in (
-            "default credentials",
-            "cannot configure",
-            "refresh token is invalid",
-            "cannot get access token",
-            "to reauthenticate",
-            "invalid_client",
-            "unauthorized_client",
-        )
-    )
-
-
-def service_principal_oauth_incomplete() -> bool:
-    """True if OAuth M2M was started (client id set) but the client secret is missing.
-
-    PAT or ``DATABRICKS_CONFIG_PROFILE`` counts as an alternate auth path; if set,
-    we do not block (see also :func:`_normalize_databricks_env_vars`, which drops
-    incomplete OAuth when a profile is present).
-    """
-    cid = os.getenv("DATABRICKS_CLIENT_ID", "").strip()
-    csec = os.getenv("DATABRICKS_CLIENT_SECRET", "").strip()
-    if not cid or csec:
-        return False
-    if os.getenv("DATABRICKS_TOKEN", "").strip():
-        return False
-    if os.getenv("DATABRICKS_CONFIG_PROFILE", "").strip():
-        return False
-    return True
-
-
-def _run_query(w: WorkspaceClient, sql: str, label: str) -> pd.DataFrame:
-    """Paginated SQL execution against the configured warehouse."""
-    all_rows: list = []
-    columns: list[str] | None = None
-    offset = 0
-
+@st.cache_data(ttl=CACHE_TTL_SHORT)
+def _fetch_ticker_info(symbol: str) -> dict:
+    """Fetch ticker info from yfinance with error handling."""
     try:
-        while True:
-            paginated = (
-                f"SELECT * FROM ({sql}) _q LIMIT {CHUNK_SIZE} OFFSET {offset}"
-            )
-            resp = w.statement_execution.execute_statement(
-                warehouse_id=SQL_WAREHOUSE_ID,
-                statement=paginated,
-                wait_timeout="0s",
-            )
-
-            while resp.status.state in (
-                StatementState.PENDING,
-                StatementState.RUNNING,
-            ):
-                time.sleep(1)
-                resp = w.statement_execution.get_statement(resp.statement_id)
-
-            if resp.status.state != StatementState.SUCCEEDED:
-                st.error(
-                    f"Query '{label}' failed (state={resp.status.state}): "
-                    f"{getattr(resp.status, 'error', 'unknown')}"
-                )
-                break
-
-            if columns is None:
-                schema = None
-                if (
-                    resp.manifest is not None
-                    and hasattr(resp.manifest, "schema")
-                    and resp.manifest.schema is not None
-                ):
-                    schema = resp.manifest.schema
-                elif (
-                    hasattr(resp.result, "schema")
-                    and resp.result.schema is not None
-                ):
-                    schema = resp.result.schema
-
-                if schema is None:
-                    st.error(f"Query '{label}': cannot locate schema.")
-                    return pd.DataFrame()
-
-                columns = [c.name for c in schema.columns]
-
-            if resp.result is None or not resp.result.data_array:
-                break
-
-            chunk = resp.result.data_array
-            all_rows.extend(chunk)
-
-            if len(chunk) < CHUNK_SIZE:
-                break
-            offset += CHUNK_SIZE
-
-        if not all_rows:
-            return pd.DataFrame(columns=columns) if columns else pd.DataFrame()
-        return pd.DataFrame(all_rows, columns=columns)
-
+        ticker = yf.Ticker(symbol)
+        return ticker.info or {}
     except Exception as exc:
-        st.error(f"Exception in query '{label}': {exc}")
+        st.warning(f"Could not fetch info for {symbol}: {exc}")
+        return {}
+
+
+@st.cache_data(ttl=CACHE_TTL_SHORT)
+def _fetch_price_history(symbol: str, period: str = "5y") -> pd.DataFrame:
+    """Fetch historical OHLCV data from yfinance."""
+    try:
+        ticker = yf.Ticker(symbol)
+        hist = ticker.history(period=period, auto_adjust=True)
+        if hist.empty:
+            return pd.DataFrame()
+        hist.index = pd.to_datetime(hist.index).normalize()
+        hist = hist.reset_index()
+        hist.columns = [c.lower() for c in hist.columns]
+        hist["symbol"] = symbol.upper()
+        hist = hist.rename(columns={"date": "report_date"})
+        return hist
+    except Exception:
         return pd.DataFrame()
 
 
-def _run_query_optional(
-    w: WorkspaceClient, sql: str, label: str
-) -> pd.DataFrame | None:
-    """Same as _run_query but returns None on auth/SQL errors (no Streamlit UI)."""
-    all_rows: list = []
-    columns: list[str] | None = None
-    offset = 0
-
+@st.cache_data(ttl=CACHE_TTL_SHORT)
+def _fetch_dividends(symbol: str) -> pd.DataFrame:
+    """Fetch dividend history from yfinance."""
     try:
-        while True:
-            paginated = (
-                f"SELECT * FROM ({sql}) _q LIMIT {CHUNK_SIZE} OFFSET {offset}"
-            )
-            resp = w.statement_execution.execute_statement(
-                warehouse_id=SQL_WAREHOUSE_ID,
-                statement=paginated,
-                wait_timeout="0s",
-            )
-
-            while resp.status.state in (
-                StatementState.PENDING,
-                StatementState.RUNNING,
-            ):
-                time.sleep(1)
-                resp = w.statement_execution.get_statement(resp.statement_id)
-
-            if resp.status.state != StatementState.SUCCEEDED:
-                return None
-
-            if columns is None:
-                schema = None
-                if (
-                    resp.manifest is not None
-                    and hasattr(resp.manifest, "schema")
-                    and resp.manifest.schema is not None
-                ):
-                    schema = resp.manifest.schema
-                elif (
-                    hasattr(resp.result, "schema")
-                    and resp.result.schema is not None
-                ):
-                    schema = resp.result.schema
-
-                if schema is None:
-                    return None
-
-                columns = [c.name for c in schema.columns]
-
-            if resp.result is None or not resp.result.data_array:
-                break
-
-            chunk = resp.result.data_array
-            all_rows.extend(chunk)
-
-            if len(chunk) < CHUNK_SIZE:
-                break
-            offset += CHUNK_SIZE
-
-        if not all_rows:
-            return pd.DataFrame(columns=columns) if columns else pd.DataFrame()
-        return pd.DataFrame(all_rows, columns=columns)
-
+        ticker = yf.Ticker(symbol)
+        divs = ticker.dividends
+        if divs is None or divs.empty:
+            return pd.DataFrame()
+        df = pd.DataFrame({
+            "symbol": symbol.upper(),
+            "report_date": pd.to_datetime(divs.index).normalize(),
+            "amount": divs.values,
+        })
+        return df.reset_index(drop=True)
     except Exception:
-        return None
+        return pd.DataFrame()
 
 
-def run_sql_query(sql: str, label: str = "query") -> pd.DataFrame:
-    """Public helper – run any read-only SQL against the warehouse."""
-    return _run_query(WorkspaceClient(), sql, label)
-
-
-def run_sql_query_optional(sql: str, label: str = "query") -> pd.DataFrame | None:
-    """Like ``run_sql_query`` but returns ``None`` on failure (for optional features / fallbacks)."""
-    try:
-        return _run_query_optional(WorkspaceClient(), sql, label)
-    except Exception:
-        return None
-
-
-# ---------------------------------------------------------------------------
-# INGEST  — yfinance → Delta tables
-# ---------------------------------------------------------------------------
-
-def _tbl(name: str) -> str:
-    return f"{CATALOG}.{SCHEMA}.{name}"
-
-
-def _exec_ddl(w: WorkspaceClient, sql: str) -> None:
-    """Run a DDL/DML statement (no result expected)."""
-    resp = w.statement_execution.execute_statement(
-        warehouse_id=SQL_WAREHOUSE_ID,
-        statement=sql,
-        wait_timeout="0s",
-    )
-    while resp.status.state in (StatementState.PENDING, StatementState.RUNNING):
-        time.sleep(1)
-        resp = w.statement_execution.get_statement(resp.statement_id)
-    if resp.status.state != StatementState.SUCCEEDED:
-        raise RuntimeError(
-            f"DDL failed ({resp.status.state}): "
-            f"{getattr(resp.status, 'error', sql[:120])}"
-        )
-
-
-def _insert_df(w: WorkspaceClient, df: pd.DataFrame, table: str) -> None:
-    """
-    Bulk-insert a DataFrame into a Delta table using multi-row INSERT VALUES.
-    Processes in batches of 500 rows to stay within SQL size limits.
-    """
-    if df.empty:
-        return
-
-    cols = list(df.columns)
-    col_str = ", ".join(f"`{c}`" for c in cols)
-    batch_size = 500
-
-    for start in range(0, len(df), batch_size):
-        batch = df.iloc[start : start + batch_size]
-        rows_sql: list[str] = []
-        for _, row in batch.iterrows():
-            vals: list[str] = []
-            for c in cols:
-                v = row[c]
-                if v is None or (isinstance(v, float) and pd.isna(v)):
-                    vals.append("NULL")
-                elif isinstance(v, (int, float)):
-                    vals.append(str(v))
-                else:
-                    escaped = str(v).replace("'", "''").replace("\\", "\\\\")
-                    vals.append(f"'{escaped}'")
-            rows_sql.append(f"({', '.join(vals)})")
-
-        insert_sql = (
-            f"INSERT INTO {_tbl(table)} ({col_str}) VALUES "
-            + ", ".join(rows_sql)
-        )
-        _exec_ddl(w, insert_sql)
-
-
-def ingest_tickers(
-    symbols: list[str] | None = None,
-    *,
-    price_period: str = "5y",
-    truncate: bool = True,
-) -> None:
-    """
-    Fetch data from yfinance for each symbol and write it into Databricks
-    Delta tables.  Run this from a Databricks notebook or Job — NOT inside
-    the Streamlit app itself.
-
-    Parameters
-    ----------
-    symbols     : list of ticker strings; defaults to DEFAULT_TICKERS
-    price_period: yfinance history period (e.g. "5y", "2y", "1y")
-    truncate    : if True, TRUNCATE each table before inserting fresh data
-    """
-    import yfinance as yf  # only needed at ingest time
-
-    syms = [s.strip().upper() for s in (symbols or DEFAULT_TICKERS) if s.strip()]
-    w = WorkspaceClient()
-
-    # ---- ensure tables exist -------------------------------------------------
-    ddl_map = {
-        "stock_profile": """
-            CREATE TABLE IF NOT EXISTS {tbl} (
-                symbol          STRING,
-                sector          STRING,
-                industry        STRING,
-                long_business_summary STRING,
-                report_date     DATE
-            ) USING DELTA
-        """,
-        "stock_prices": """
-            CREATE TABLE IF NOT EXISTS {tbl} (
-                symbol      STRING,
-                report_date DATE,
-                open        DOUBLE,
-                high        DOUBLE,
-                low         DOUBLE,
-                close       DOUBLE,
-                volume      DOUBLE
-            ) USING DELTA
-        """,
-        "stock_sec_filing": """
-            CREATE TABLE IF NOT EXISTS {tbl} (
-                symbol       STRING,
-                company_name STRING,
-                filing_date  DATE
-            ) USING DELTA
-        """,
-        "stock_dividend_events": """
-            CREATE TABLE IF NOT EXISTS {tbl} (
-                symbol      STRING,
-                report_date DATE,
-                amount      DOUBLE
-            ) USING DELTA
-        """,
-        "stock_tailing_eps": """
-            CREATE TABLE IF NOT EXISTS {tbl} (
-                symbol      STRING,
-                tailing_eps DOUBLE,
-                report_date DATE
-            ) USING DELTA
-        """,
-        "stock_statement": """
-            CREATE TABLE IF NOT EXISTS {tbl} (
-                symbol       STRING,
-                item_name    STRING,
-                item_value   DOUBLE,
-                report_date  DATE,
-                period_type  STRING,
-                finance_type STRING
-            ) USING DELTA
-        """,
-    }
-
-    for tname, ddl_tmpl in ddl_map.items():
-        _exec_ddl(w, ddl_tmpl.format(tbl=_tbl(tname)))
-
-    if truncate:
-        for tname in ddl_map:
-            try:
-                _exec_ddl(w, f"TRUNCATE TABLE {_tbl(tname)}")
-            except Exception:
-                pass  # table may be empty on first run
-
-    # ---- fetch + insert per ticker -------------------------------------------
-    today = pd.Timestamp.today().normalize()
-
-    profile_rows: list[dict] = []
-    price_rows: list[dict] = []
-    filing_rows: list[dict] = []
-    div_rows: list[dict] = []
-    eps_rows: list[dict] = []
-    stmt_rows: list[dict] = []
-
-    for sym in syms:
-        print(f"  Fetching {sym}…")
-        try:
-            ticker = yf.Ticker(sym)
-            info = ticker.info or {}
-
-            # --- profile ------------------------------------------------------
-            profile_rows.append(
-                {
-                    "symbol": sym,
-                    "sector": info.get("sector", "Unknown"),
-                    "industry": info.get("industry", "Unknown"),
-                    "long_business_summary": (
-                        info.get("longBusinessSummary", "")[:2000]
-                    ),
-                    "report_date": str(today.date()),
-                }
-            )
-
-            # --- company name (SEC filing proxy) ------------------------------
-            company_name = (
-                info.get("longName")
-                or info.get("shortName")
-                or sym
-            )
-            filing_rows.append(
-                {
-                    "symbol": sym,
-                    "company_name": company_name,
-                    "filing_date": str(today.date()),
-                }
-            )
-
-            # --- price history ------------------------------------------------
-            hist = ticker.history(period=price_period, auto_adjust=True)
-            hist.index = pd.to_datetime(hist.index).normalize()
-            for dt, row in hist.iterrows():
-                price_rows.append(
-                    {
-                        "symbol": sym,
-                        "report_date": str(dt.date()),
-                        "open": round(float(row.get("Open", 0) or 0), 6),
-                        "high": round(float(row.get("High", 0) or 0), 6),
-                        "low": round(float(row.get("Low", 0) or 0), 6),
-                        "close": round(float(row.get("Close", 0) or 0), 6),
-                        "volume": float(row.get("Volume", 0) or 0),
-                    }
-                )
-
-            # --- dividends ----------------------------------------------------
-            divs = ticker.dividends
-            if divs is not None and not divs.empty:
-                divs.index = pd.to_datetime(divs.index).normalize()
-                for dt, amt in divs.items():
-                    div_rows.append(
-                        {
-                            "symbol": sym,
-                            "report_date": str(dt.date()),
-                            "amount": round(float(amt), 6),
-                        }
-                    )
-
-            # --- trailing EPS -------------------------------------------------
-            eps_val = info.get("trailingEps")
-            if eps_val is not None:
-                eps_rows.append(
-                    {
-                        "symbol": sym,
-                        "tailing_eps": round(float(eps_val), 6),
-                        "report_date": str(today.date()),
-                    }
-                )
-
-            # --- annual revenue from financials --------------------------------
-            try:
-                fin = ticker.financials  # rows = items, cols = dates
-                if fin is not None and not fin.empty:
-                    rev_row = None
-                    for idx in fin.index:
-                        if "revenue" in str(idx).lower() or "total revenue" in str(idx).lower():
-                            rev_row = fin.loc[idx]
-                            break
-                    if rev_row is not None:
-                        for col in rev_row.index:
-                            val = rev_row[col]
-                            if pd.notna(val):
-                                stmt_rows.append(
-                                    {
-                                        "symbol": sym,
-                                        "item_name": "Total Revenue",
-                                        "item_value": float(val),
-                                        "report_date": str(
-                                            pd.Timestamp(col).date()
-                                        ),
-                                        "period_type": "annual",
-                                        "finance_type": "income_statement",
-                                    }
-                                )
-            except Exception:
-                pass  # financials not available for some tickers
-
-        except Exception as exc:
-            print(f"  WARNING: could not fetch {sym}: {exc}")
-            continue
-
-    # ---- batch insert --------------------------------------------------------
-    def _insert(rows: list[dict], table: str) -> None:
-        if not rows:
-            return
-        df = pd.DataFrame(rows)
-        _insert_df(w, df, table)
-
-    print("Inserting stock_profile…")
-    _insert(profile_rows, "stock_profile")
-
-    print("Inserting stock_prices…")
-    _insert(price_rows, "stock_prices")
-
-    print("Inserting stock_sec_filing…")
-    _insert(filing_rows, "stock_sec_filing")
-
-    print("Inserting stock_dividend_events…")
-    _insert(div_rows, "stock_dividend_events")
-
-    print("Inserting stock_tailing_eps…")
-    _insert(eps_rows, "stock_tailing_eps")
-
-    print("Inserting stock_statement…")
-    _insert(stmt_rows, "stock_statement")
-
-    print("Ingest complete.")
+@st.cache_data(ttl=CACHE_TTL_MEDIUM)
+def _fetch_batch_tickers(symbols: tuple[str, ...]) -> pd.DataFrame:
+    """Fetch basic info for multiple tickers at once."""
+    records = []
+    for symbol in symbols:
+        info = _fetch_ticker_info(symbol)
+        if info:
+            records.append({
+                "symbol": symbol.upper(),
+                "sector": info.get("sector", "Unknown"),
+                "industry": info.get("industry", "Unknown"),
+                "long_business_summary": (info.get("longBusinessSummary", "") or "")[:2000],
+                "company_name": info.get("longName") or info.get("shortName") or symbol.upper(),
+                "report_date": pd.Timestamp.today().normalize().date(),
+            })
+    
+    if not records:
+        return pd.DataFrame()
+    return pd.DataFrame(records)
 
 
 # ---------------------------------------------------------------------------
-# READ helpers  — all data comes from Delta tables via SQL
+# Public READ helpers – Direct pandas operations on yfinance data
 # ---------------------------------------------------------------------------
 
-@st.cache_data(ttl=300)
+@st.cache_data(ttl=CACHE_TTL_SHORT)
 def load_homepage_data() -> pd.DataFrame:
-    w = WorkspaceClient()
-
-    query_profile = f"""
-        SELECT symbol, sector, industry, long_business_summary, report_date
-        FROM {_tbl('stock_profile')}
-    """
-    query_sec = f"""
-        SELECT symbol, company_name, filing_date
-        FROM (
-            SELECT
-                symbol,
-                company_name,
-                filing_date,
-                ROW_NUMBER() OVER (PARTITION BY symbol ORDER BY filing_date DESC) AS rn
-            FROM {_tbl('stock_sec_filing')}
-        ) ranked
-        WHERE rn = 1
-    """
-
-    profile_df = _run_query(w, query_profile, "stock_profile")
+    """Load company profiles with latest data."""
+    symbols = tuple(DEFAULT_TICKERS)
+    profile_df = _fetch_batch_tickers(symbols)
+    
     if profile_df.empty:
         return pd.DataFrame()
-
-    sec_df = _run_query(w, query_sec, "stock_sec_filing")
-
+    
     profile_df["symbol"] = profile_df["symbol"].astype(str).str.strip().str.upper()
     profile_df["sector"] = profile_df["sector"].astype(str).str.strip()
     profile_df["industry"] = profile_df["industry"].astype(str).str.strip()
-    profile_df["report_date"] = pd.to_datetime(profile_df["report_date"], errors="coerce")
     profile_df = profile_df.dropna(subset=["symbol", "sector"])
     profile_df = (
         profile_df
         .sort_values(["symbol", "report_date"])
         .drop_duplicates(subset=["symbol"], keep="last")
     )
-
-    if sec_df.empty:
-        profile_df["company_name"] = profile_df["symbol"]
-        return profile_df.sort_values(["sector", "company_name"]).reset_index(drop=True)
-
-    sec_df["symbol"] = sec_df["symbol"].astype(str).str.strip().str.upper()
-    sec_df["company_name"] = sec_df["company_name"].astype(str).str.strip()
-    sec_df["filing_date"] = pd.to_datetime(sec_df["filing_date"], errors="coerce")
-    sec_df = sec_df.dropna(subset=["symbol", "company_name"])
-    sec_df = sec_df[sec_df["company_name"] != ""]
-    sec_df = sec_df[sec_df["company_name"].str.lower() != "nan"]
-    sec_df = (
-        sec_df
-        .sort_values(["symbol", "filing_date"])
-        .drop_duplicates(subset=["symbol"], keep="last")
-    )
-
-    df = profile_df.merge(sec_df[["symbol", "company_name"]], on="symbol", how="left")
-    df["company_name"] = df["company_name"].fillna(df["symbol"])
-    return df.sort_values(["sector", "company_name"]).reset_index(drop=True)
+    
+    return profile_df.sort_values(["sector", "company_name"]).reset_index(drop=True)
 
 
-@st.cache_data(ttl=300)
+@st.cache_data(ttl=CACHE_TTL_SHORT)
 def load_price_snapshot() -> pd.DataFrame:
-    w = WorkspaceClient()
-
-    query_prices = f"""
-        SELECT symbol, report_date, close
-        FROM (
-            SELECT
-                symbol,
-                report_date,
-                close,
-                ROW_NUMBER() OVER (PARTITION BY symbol ORDER BY report_date DESC) AS rn
-            FROM {_tbl('stock_prices')}
-        ) ranked
-        WHERE rn = 1
-    """
-
-    prices_df = _run_query(w, query_prices, "stock_prices")
-    if prices_df.empty:
+    """Get latest price for each symbol."""
+    prices_list = []
+    for symbol in DEFAULT_TICKERS:
+        hist = _fetch_price_history(symbol, period="1y")
+        if not hist.empty:
+            latest = hist.iloc[-1:].copy()
+            prices_list.append(latest)
+    
+    if not prices_list:
         return pd.DataFrame(columns=["symbol", "report_date", "close"])
-
+    
+    prices_df = pd.concat(prices_list, ignore_index=True)
     prices_df["symbol"] = prices_df["symbol"].astype(str).str.strip().str.upper()
     prices_df["report_date"] = pd.to_datetime(prices_df["report_date"], errors="coerce")
     prices_df["close"] = pd.to_numeric(prices_df["close"], errors="coerce")
     prices_df = prices_df.dropna(subset=["symbol", "report_date", "close"])
-    return prices_df.reset_index(drop=True)
+    return prices_df[["symbol", "report_date", "close"]].reset_index(drop=True)
 
 
-@st.cache_data(ttl=300)
+@st.cache_data(ttl=CACHE_TTL_SHORT)
 def load_latest_price_date() -> str:
-    """
-    Return the single latest report_date present in stock_prices as a
-    formatted string 'YYYY-MM-DD', or '—' if unavailable.
-
-    This is the authoritative "data freshness" date shown on the home page —
-    it reflects the most recent trading day that was successfully ingested
-    from yfinance into the Delta table.
-    """
-    sql = f"SELECT MAX(report_date) AS latest_date FROM {_tbl('stock_prices')}"
-    try:
-        df = run_sql_query(sql, "latest_price_date")
-        if df.empty or df["latest_date"].isna().all():
-            return "—"
-        val = pd.to_datetime(df["latest_date"].iloc[0], errors="coerce")
-        if pd.isna(val):
-            return "—"
-        return val.strftime("%Y-%m-%d")
-    except Exception:
+    """Return the latest trading date as 'YYYY-MM-DD'."""
+    prices = load_price_snapshot()
+    if prices.empty or prices["report_date"].isna().all():
         return "—"
+    latest = prices["report_date"].max()
+    if pd.isna(latest):
+        return "—"
+    return pd.Timestamp(latest).strftime("%Y-%m-%d")
 
 
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=CACHE_TTL_SHORT, show_spinner=False)
 def load_price_history(symbols: tuple[str, ...], lookback_days: int = 1825) -> pd.DataFrame:
-    """
-    Daily close prices for the given symbols over the lookback window.
-
-    Tuple input keeps the result hashable for st.cache_data. Returns a long
-    DataFrame with columns: symbol, report_date (datetime64), close (float).
-    Empty if no symbols are provided or the warehouse has no rows.
-    """
+    """Daily close prices for given symbols."""
     syms = tuple(s.strip().upper() for s in symbols if s and s.strip())
     if not syms:
         return pd.DataFrame(columns=["symbol", "report_date", "close"])
-
-    in_list = ", ".join(f"'{_sql_quote(s)}'" for s in syms)
-    sql = f"""
-        SELECT symbol, report_date, close
-        FROM {_tbl('stock_prices')}
-        WHERE symbol IN ({in_list})
-          AND report_date >= DATE_SUB(CURRENT_DATE(), {int(lookback_days)})
-    """
-
-    w = WorkspaceClient()
-    df = _run_query(w, sql, "stock_prices_history")
-    if df.empty:
+    
+    period_map = {
+        1825: "5y",
+        730: "2y",
+        365: "1y",
+        90: "3mo",
+        30: "1mo",
+    }
+    period = period_map.get(lookback_days, "5y")
+    
+    prices_list = []
+    for symbol in syms:
+        hist = _fetch_price_history(symbol, period=period)
+        if not hist.empty:
+            prices_list.append(hist[["symbol", "report_date", "close"]])
+    
+    if not prices_list:
         return pd.DataFrame(columns=["symbol", "report_date", "close"])
-
+    
+    df = pd.concat(prices_list, ignore_index=True)
     df["symbol"] = df["symbol"].astype(str).str.strip().str.upper()
     df["report_date"] = pd.to_datetime(df["report_date"], errors="coerce")
     df["close"] = pd.to_numeric(df["close"], errors="coerce")
     df = df.dropna(subset=["symbol", "report_date", "close"])
+    
+    cutoff = pd.Timestamp.today() - pd.Timedelta(days=lookback_days)
+    df = df[df["report_date"] >= cutoff]
+    
     return df.sort_values(["symbol", "report_date"]).reset_index(drop=True)
 
 
-@st.cache_data(ttl=300)
+@st.cache_data(ttl=CACHE_TTL_SHORT)
 def load_stock_metrics() -> pd.DataFrame:
-    w = WorkspaceClient()
-
-    query_price_metrics = f"""
-        SELECT
-            curr.symbol,
-            curr.close AS latest_close,
-            prev.close AS close_365d_ago,
-            ROUND((curr.close - prev.close) / NULLIF(prev.close, 0) * 100, 2) AS price_momentum,
-            vol.volatility
-        FROM (
-            SELECT symbol, close,
-                ROW_NUMBER() OVER (PARTITION BY symbol ORDER BY report_date DESC) AS rn
-            FROM {_tbl('stock_prices')}
-        ) curr
-        LEFT JOIN (
-            SELECT symbol, close,
-                ROW_NUMBER() OVER (
-                    PARTITION BY symbol
-                    ORDER BY report_date DESC
-                ) AS rn
-            FROM {_tbl('stock_prices')}
-            WHERE report_date <= DATE_SUB(CURRENT_DATE(), 365)
-        ) prev ON curr.symbol = prev.symbol AND prev.rn = 1
-        LEFT JOIN (
-            SELECT symbol,
-                ROUND(AVG((high - low) / NULLIF(close, 0)) * 100, 2) AS volatility
-            FROM {_tbl('stock_prices')}
-            WHERE report_date >= DATE_SUB(CURRENT_DATE(), 90)
-            GROUP BY symbol
-        ) vol ON curr.symbol = vol.symbol
-        WHERE curr.rn = 1
-    """
-
-    query_dividends = f"""
-        SELECT DISTINCT symbol, 1 AS pays_dividends
-        FROM {_tbl('stock_dividend_events')}
-        WHERE report_date >= DATE_SUB(CURRENT_DATE(), 730)
-          AND amount > 0
-    """
-
-    query_eps = f"""
-        SELECT symbol, tailing_eps
-        FROM (
-            SELECT symbol, tailing_eps,
-                ROW_NUMBER() OVER (PARTITION BY symbol ORDER BY report_date DESC) AS rn
-            FROM {_tbl('stock_tailing_eps')}
-        ) ranked
-        WHERE rn = 1
-    """
-
-    query_revenue = f"""
-        SELECT
-            curr.symbol,
-            ROUND((curr.item_value - prev.item_value) / NULLIF(ABS(prev.item_value), 0) * 100, 2) AS revenue_growth
-        FROM (
-            SELECT symbol, item_value, report_date,
-                ROW_NUMBER() OVER (PARTITION BY symbol ORDER BY report_date DESC) AS rn
-            FROM {_tbl('stock_statement')}
-            WHERE LOWER(item_name) LIKE '%total revenue%'
-              AND finance_type = 'income_statement'
-              AND period_type = 'annual'
-        ) curr
-        LEFT JOIN (
-            SELECT symbol, item_value, report_date,
-                ROW_NUMBER() OVER (PARTITION BY symbol ORDER BY report_date DESC) AS rn
-            FROM {_tbl('stock_statement')}
-            WHERE LOWER(item_name) LIKE '%total revenue%'
-              AND finance_type = 'income_statement'
-              AND period_type = 'annual'
-        ) prev ON curr.symbol = prev.symbol AND prev.rn = 2
-        WHERE curr.rn = 1
-    """
-
-    price_metrics_df = _run_query(w, query_price_metrics, "price_metrics")
-    dividends_df = _run_query(w, query_dividends, "dividends")
-    eps_df = _run_query(w, query_eps, "trailing_eps")
-    revenue_df = _run_query(w, query_revenue, "revenue_growth")
-
-    if price_metrics_df.empty:
+    """Load price momentum, volatility, dividends, EPS, and revenue growth."""
+    symbols = tuple(DEFAULT_TICKERS)
+    metrics_list = []
+    
+    for symbol in symbols:
+        try:
+            info = _fetch_ticker_info(symbol)
+            hist = _fetch_price_history(symbol, period="5y")
+            divs = _fetch_dividends(symbol)
+            
+            if hist.empty:
+                continue
+            
+            latest_close = hist.iloc[-1]["close"]
+            
+            # Price momentum (1Y)
+            year_ago = pd.Timestamp.today() - pd.Timedelta(days=365)
+            year_ago_data = hist[hist["report_date"] <= year_ago]
+            price_momentum = None
+            if not year_ago_data.empty:
+                year_ago_close = year_ago_data.iloc[-1]["close"]
+                if year_ago_close != 0:
+                    price_momentum = round((latest_close - year_ago_close) / year_ago_close * 100, 2)
+            
+            # Volatility (90D)
+            recent = hist[hist["report_date"] >= pd.Timestamp.today() - pd.Timedelta(days=90)]
+            volatility = None
+            if not recent.empty and "high" in recent.columns and "low" in recent.columns:
+                volatility = round(
+                    ((recent["high"] - recent["low"]) / recent["close"].fillna(1)).mean() * 100,
+                    2
+                )
+            
+            # Dividends
+            pays_dividends = 0 if divs.empty else 1
+            
+            # EPS
+            tailing_eps = info.get("trailingEps")
+            
+            # Revenue growth
+            revenue_growth = None
+            try:
+                fin = yf.Ticker(symbol).financials
+                if fin is not None and not fin.empty:
+                    rev_rows = [idx for idx in fin.index if "revenue" in str(idx).lower()]
+                    if rev_rows:
+                        rev_data = fin.loc[rev_rows[0]].dropna().sort_index(ascending=False)
+                        if len(rev_data) >= 2:
+                            curr_rev = rev_data.iloc[0]
+                            prev_rev = rev_data.iloc[1]
+                            if prev_rev != 0:
+                                revenue_growth = round((curr_rev - prev_rev) / abs(prev_rev) * 100, 2)
+            except Exception:
+                pass
+            
+            metrics_list.append({
+                "symbol": symbol.upper(),
+                "latest_close": latest_close,
+                "price_momentum": price_momentum,
+                "volatility": volatility,
+                "pays_dividends": pays_dividends,
+                "tailing_eps": tailing_eps,
+                "revenue_growth": revenue_growth,
+            })
+        except Exception:
+            continue
+    
+    if not metrics_list:
         return pd.DataFrame()
-
-    price_metrics_df["symbol"] = price_metrics_df["symbol"].astype(str).str.strip().str.upper()
-    price_metrics_df["price_momentum"] = pd.to_numeric(price_metrics_df["price_momentum"], errors="coerce")
-    price_metrics_df["volatility"] = pd.to_numeric(price_metrics_df["volatility"], errors="coerce")
-    price_metrics_df["latest_close"] = pd.to_numeric(price_metrics_df["latest_close"], errors="coerce")
-
-    metrics = price_metrics_df[["symbol", "latest_close", "price_momentum", "volatility"]].copy()
-
-    if not dividends_df.empty:
-        dividends_df["symbol"] = dividends_df["symbol"].astype(str).str.strip().str.upper()
-        dividends_df["pays_dividends"] = (
-            pd.to_numeric(dividends_df["pays_dividends"], errors="coerce").fillna(0).astype(int)
-        )
-        metrics = metrics.merge(dividends_df[["symbol", "pays_dividends"]], on="symbol", how="left")
-    else:
-        metrics["pays_dividends"] = 0
-
-    metrics["pays_dividends"] = metrics["pays_dividends"].fillna(0).astype(int)
-
-    if not eps_df.empty:
-        eps_df["symbol"] = eps_df["symbol"].astype(str).str.strip().str.upper()
-        eps_df["tailing_eps"] = pd.to_numeric(eps_df["tailing_eps"], errors="coerce")
-        metrics = metrics.merge(eps_df[["symbol", "tailing_eps"]], on="symbol", how="left")
-    else:
-        metrics["tailing_eps"] = None
-
-    if not revenue_df.empty:
-        revenue_df["symbol"] = revenue_df["symbol"].astype(str).str.strip().str.upper()
-        revenue_df["revenue_growth"] = pd.to_numeric(revenue_df["revenue_growth"], errors="coerce")
-        metrics = metrics.merge(revenue_df[["symbol", "revenue_growth"]], on="symbol", how="left")
-    else:
-        metrics["revenue_growth"] = None
-
-    return metrics.reset_index(drop=True)
+    
+    return pd.DataFrame(metrics_list).reset_index(drop=True)
 
 
 # ---------------------------------------------------------------------------
@@ -865,6 +311,7 @@ def prepare_merged_universe(
     wants_dividends: bool,
     prefer_lower_price: bool,
 ) -> pd.DataFrame:
+    """Merge profile, prices, and metrics with filtering."""
     if profile_df.empty or latest_prices_df.empty:
         return pd.DataFrame()
 
@@ -907,6 +354,7 @@ def snapshot_for_symbols(
     latest_prices_df: pd.DataFrame,
     metrics_df: pd.DataFrame,
 ) -> pd.DataFrame:
+    """Get snapshot data for specific symbols."""
     if not symbols or profile_df.empty or latest_prices_df.empty:
         return pd.DataFrame()
 
@@ -943,6 +391,7 @@ def snapshot_for_symbols(
 
 
 def company_label_options(profile_df: pd.DataFrame) -> tuple[list[str], dict[str, str]]:
+    """Generate dropdown options for company selection."""
     if profile_df.empty or "symbol" not in profile_df.columns:
         return [], {}
 
@@ -962,6 +411,7 @@ def company_label_options(profile_df: pd.DataFrame) -> tuple[list[str], dict[str
 
 
 def yahoo_style_comparison_table(snapshot: pd.DataFrame) -> pd.DataFrame:
+    """Format snapshot as comparison table."""
     if snapshot.empty:
         return pd.DataFrame()
 
@@ -997,202 +447,119 @@ def yahoo_style_comparison_table(snapshot: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(cols)
 
 
-def _sql_quote(s: str) -> str:
-    return str(s).replace("'", "''")
-
-
 # ---------------------------------------------------------------------------
 # Analytics views — Market Intelligence page
 # ---------------------------------------------------------------------------
 
-@st.cache_data(ttl=300)
+@st.cache_data(ttl=CACHE_TTL_SHORT)
 def load_sector_benchmarks() -> pd.DataFrame:
-    sql = f"""
-        WITH prof AS (
-            SELECT symbol, sector
-            FROM (
-                SELECT symbol, sector,
-                    ROW_NUMBER() OVER (PARTITION BY symbol ORDER BY report_date DESC) AS rn
-                FROM {_tbl('stock_profile')}
-            ) t
-            WHERE rn = 1
-        ),
-        mom AS (
-            SELECT
-                curr.symbol,
-                ROUND((curr.close - prev.close) / NULLIF(prev.close, 0) * 100, 2) AS price_momentum
-            FROM (
-                SELECT symbol, close,
-                    ROW_NUMBER() OVER (PARTITION BY symbol ORDER BY report_date DESC) AS rn
-                FROM {_tbl('stock_prices')}
-            ) curr
-            LEFT JOIN (
-                SELECT symbol, close,
-                    ROW_NUMBER() OVER (
-                        PARTITION BY symbol
-                        ORDER BY report_date DESC
-                    ) AS rn
-                FROM {_tbl('stock_prices')}
-                WHERE report_date <= DATE_SUB(CURRENT_DATE(), 365)
-            ) prev ON curr.symbol = prev.symbol AND prev.rn = 1
-            WHERE curr.rn = 1
-        ),
-        vol AS (
-            SELECT symbol,
-                ROUND(AVG((high - low) / NULLIF(close, 0)) * 100, 2) AS volatility
-            FROM {_tbl('stock_prices')}
-            WHERE report_date >= DATE_SUB(CURRENT_DATE(), 90)
-            GROUP BY symbol
-        )
-        SELECT
-            pr.sector,
-            COUNT(DISTINCT pr.symbol) AS symbol_count,
-            ROUND(AVG(m.price_momentum), 2) AS avg_1y_momentum_pct,
-            ROUND(AVG(v.volatility), 2) AS avg_90d_volatility_pct
-        FROM prof pr
-        LEFT JOIN mom m ON pr.symbol = m.symbol
-        LEFT JOIN vol v ON pr.symbol = v.symbol
-        WHERE pr.sector IS NOT NULL AND TRIM(CAST(pr.sector AS STRING)) != ''
-        GROUP BY pr.sector
-        ORDER BY symbol_count DESC
-    """
-    return run_sql_query(sql, "sector_benchmarks")
+    """Calculate average metrics by sector."""
+    profile = load_homepage_data()
+    metrics = load_stock_metrics()
+    
+    if profile.empty or metrics.empty:
+        return pd.DataFrame()
+    
+    merged = profile.merge(metrics, on="symbol", how="left")
+    
+    sector_stats = merged.groupby("sector").agg({
+        "symbol": "count",
+        "price_momentum": "mean",
+        "volatility": "mean",
+    }).reset_index()
+    
+    sector_stats.columns = ["sector", "symbol_count", "avg_1y_momentum_pct", "avg_90d_volatility_pct"]
+    sector_stats = sector_stats.fillna(0).round(2)
+    
+    return sector_stats.sort_values("symbol_count", ascending=False).reset_index(drop=True)
 
 
-@st.cache_data(ttl=300)
+@st.cache_data(ttl=CACHE_TTL_SHORT)
 def load_top_movers(limit: int = 15, losers: bool = False) -> pd.DataFrame:
-    lim = max(1, min(int(limit), 100))
-    order = "ASC" if losers else "DESC"
-    sql = f"""
-        WITH names AS (
-            SELECT symbol, company_name
-            FROM (
-                SELECT symbol, company_name,
-                    ROW_NUMBER() OVER (PARTITION BY symbol ORDER BY filing_date DESC) AS rn
-                FROM {_tbl('stock_sec_filing')}
-            ) x
-            WHERE rn = 1
-        ),
-        mom AS (
-            SELECT
-                curr.symbol,
-                ROUND((curr.close - prev.close) / NULLIF(prev.close, 0) * 100, 2) AS price_momentum
-            FROM (
-                SELECT symbol, close,
-                    ROW_NUMBER() OVER (PARTITION BY symbol ORDER BY report_date DESC) AS rn
-                FROM {_tbl('stock_prices')}
-            ) curr
-            LEFT JOIN (
-                SELECT symbol, close,
-                    ROW_NUMBER() OVER (
-                        PARTITION BY symbol
-                        ORDER BY report_date DESC
-                    ) AS rn
-                FROM {_tbl('stock_prices')}
-                WHERE report_date <= DATE_SUB(CURRENT_DATE(), 365)
-            ) prev ON curr.symbol = prev.symbol AND prev.rn = 1
-            WHERE curr.rn = 1
-        ),
-        priced AS (
-            SELECT symbol, close AS last_close
-            FROM (
-                SELECT symbol, close,
-                    ROW_NUMBER() OVER (PARTITION BY symbol ORDER BY report_date DESC) AS rn
-                FROM {_tbl('stock_prices')}
-            ) x
-            WHERE rn = 1
-        )
-        SELECT
-            COALESCE(n.company_name, m.symbol) AS company_name,
-            m.symbol,
-            p.last_close,
-            m.price_momentum
-        FROM mom m
-        LEFT JOIN names n ON m.symbol = n.symbol
-        LEFT JOIN priced p ON m.symbol = p.symbol
-        WHERE m.price_momentum IS NOT NULL
-        ORDER BY m.price_momentum {order}
-        LIMIT {lim}
-    """
-    return run_sql_query(sql, "top_movers" if not losers else "bottom_movers")
+    """Get top price movers."""
+    profile = load_homepage_data()
+    metrics = load_stock_metrics()
+    
+    if metrics.empty:
+        return pd.DataFrame()
+    
+    merged = profile.merge(metrics, on="symbol", how="left")
+    merged = merged.dropna(subset=["price_momentum"])
+    
+    order = "ascending" if losers else "descending"
+    merged = merged.sort_values("price_momentum", ascending=losers).head(max(1, int(limit)))
+    
+    return merged[["company_name", "symbol", "latest_close", "price_momentum"]].reset_index(drop=True)
 
 
-@st.cache_data(ttl=600)
+@st.cache_data(ttl=CACHE_TTL_MEDIUM)
 def load_recent_sec_filings(limit: int = 40) -> pd.DataFrame:
+    """Get latest company filings."""
+    profile = load_homepage_data()
     lim = max(1, min(int(limit), 500))
-    sql = f"""
-        SELECT symbol, company_name, filing_date
-        FROM {_tbl('stock_sec_filing')}
-        ORDER BY filing_date DESC
-        LIMIT {lim}
-    """
-    df = run_sql_query(sql, "recent_sec_filings")
-    if not df.empty and "filing_date" in df.columns:
-        df["filing_date"] = pd.to_datetime(df["filing_date"], errors="coerce")
-    return df
+    
+    result = profile[["symbol", "company_name", "report_date"]].copy()
+    result.columns = ["symbol", "company_name", "filing_date"]
+    result = result.sort_values("filing_date", ascending=False).head(lim)
+    result["filing_date"] = pd.to_datetime(result["filing_date"], errors="coerce")
+    
+    return result.reset_index(drop=True)
 
 
-@st.cache_data(ttl=300)
+@st.cache_data(ttl=CACHE_TTL_SHORT)
 def load_volume_vs_average(limit: int = 25) -> pd.DataFrame:
-    """Symbols with the highest volume spike vs their prior 30 *sessions*.
-
-    Compares the most recent row in ``stock_prices`` to the average of rows
-    ``rn`` 2–31 (31 exclusive), i.e. the previous thirty trading observations.
-    Symbols with fewer than two rows are omitted.
-    """
+    """Get symbols with highest volume spike vs prior 30 sessions."""
     lim = max(1, min(int(limit), 200))
-    sql = f"""
-        WITH ranked AS (
-            SELECT symbol, volume,
-                ROW_NUMBER() OVER (
-                    PARTITION BY symbol
-                    ORDER BY report_date DESC
-                ) AS rn
-            FROM {_tbl('stock_prices')}
-        ),
-        last_day AS (
-            SELECT symbol, volume AS last_volume
-            FROM ranked
-            WHERE rn = 1
-        ),
-        avg_prior AS (
-            SELECT symbol, AVG(volume) AS avg_30d_volume
-            FROM ranked
-            WHERE rn > 1 AND rn <= 31
-            GROUP BY symbol
-        )
-        SELECT
-            l.symbol,
-            ROUND(l.last_volume, 0) AS last_day_volume,
-            ROUND(a.avg_30d_volume, 0) AS avg_30d_volume,
-            ROUND(l.last_volume / NULLIF(a.avg_30d_volume, 0), 2) AS volume_vs_30d_avg
-        FROM last_day l
-        INNER JOIN avg_prior a ON l.symbol = a.symbol
-        WHERE a.avg_30d_volume > 0
-        ORDER BY volume_vs_30d_avg DESC
-        LIMIT {lim}
-    """
-    return run_sql_query(sql, "volume_vs_avg")
+    volume_data = []
+    
+    for symbol in DEFAULT_TICKERS:
+        hist = _fetch_price_history(symbol, period="3mo")
+        if hist.empty or len(hist) < 31:
+            continue
+        
+        hist = hist.sort_values("report_date")
+        last_volume = hist.iloc[-1]["volume"] if "volume" in hist.columns else 0
+        prior_30 = hist.iloc[-31:-1]["volume"].mean() if "volume" in hist.columns else 0
+        
+        if prior_30 > 0:
+            ratio = last_volume / prior_30
+            volume_data.append({
+                "symbol": symbol,
+                "last_day_volume": round(last_volume, 0),
+                "avg_30d_volume": round(prior_30, 0),
+                "volume_vs_30d_avg": round(ratio, 2),
+            })
+    
+    if not volume_data:
+        return pd.DataFrame()
+    
+    df = pd.DataFrame(volume_data)
+    return df.sort_values("volume_vs_30d_avg", ascending=False).head(lim).reset_index(drop=True)
 
 
-@st.cache_data(ttl=600)
+@st.cache_data(ttl=CACHE_TTL_MEDIUM)
 def load_recent_dividend_events(limit: int = 50) -> pd.DataFrame:
+    """Get recent dividend payments."""
     lim = max(1, min(int(limit), 300))
-    sql = f"""
-        SELECT symbol, report_date, amount
-        FROM {_tbl('stock_dividend_events')}
-        ORDER BY report_date DESC
-        LIMIT {lim}
-    """
-    df = run_sql_query(sql, "dividend_events")
-    if not df.empty and "report_date" in df.columns:
-        df["report_date"] = pd.to_datetime(df["report_date"], errors="coerce")
-    if not df.empty and "amount" in df.columns:
-        df["amount"] = pd.to_numeric(df["amount"], errors="coerce")
-    return df
+    div_list = []
+    
+    for symbol in DEFAULT_TICKERS:
+        divs = _fetch_dividends(symbol)
+        if not divs.empty:
+            div_list.append(divs)
+    
+    if not div_list:
+        return pd.DataFrame()
+    
+    df = pd.concat(div_list, ignore_index=True)
+    df = df.sort_values("report_date", ascending=False).head(lim)
+    df["report_date"] = pd.to_datetime(df["report_date"], errors="coerce")
+    df["amount"] = pd.to_numeric(df["amount"], errors="coerce")
+    
+    return df.reset_index(drop=True)
 
 
-@st.cache_data(ttl=120)
+@st.cache_data(ttl=CACHE_TTL_SHORT)
 def load_screener_results(
     *,
     sector: Optional[str] = None,
@@ -1202,286 +569,84 @@ def load_screener_results(
     dividend_only: bool = False,
     limit: int = 200,
 ) -> pd.DataFrame:
+    """Screen stocks based on criteria."""
     lim = max(1, min(int(limit), 500))
-    where_extra: list[str] = []
-
-    if sector and str(sector).strip() and str(sector).strip().lower() != "any":
-        sec = _sql_quote(str(sector).strip())
-        where_extra.append(f"TRIM(base.sector) = '{sec}'")
-
+    
+    profile = load_homepage_data()
+    metrics = load_stock_metrics()
+    
+    if profile.empty or metrics.empty:
+        return pd.DataFrame()
+    
+    base = profile.merge(metrics, on="symbol", how="left")
+    
+    if sector and str(sector).strip().lower() != "any":
+        base = base[base["sector"] == sector]
+    
     if min_momentum is not None:
-        where_extra.append(f"base.price_momentum >= {float(min_momentum)}")
-
+        base = base[base["price_momentum"].fillna(-float("inf")) >= float(min_momentum)]
+    
     if max_volatility is not None:
-        where_extra.append(
-            f"(base.volatility IS NOT NULL AND base.volatility <= {float(max_volatility)})"
-        )
-
+        base = base[base["volatility"].fillna(float("inf")) <= float(max_volatility)]
+    
     if min_eps is not None:
-        where_extra.append(
-            f"(base.tailing_eps IS NOT NULL AND base.tailing_eps >= {float(min_eps)})"
-        )
-
+        base = base[base["tailing_eps"].fillna(-float("inf")) >= float(min_eps)]
+    
     if dividend_only:
-        where_extra.append("base.pays_dividends = 1")
-
-    where_sql = " AND ".join(where_extra) if where_extra else "1=1"
-
-    sql = f"""
-        WITH prof AS (
-            SELECT symbol, sector, industry
-            FROM (
-                SELECT symbol, sector, industry,
-                    ROW_NUMBER() OVER (PARTITION BY symbol ORDER BY report_date DESC) AS rn
-                FROM {_tbl('stock_profile')}
-            ) t
-            WHERE rn = 1
-        ),
-        names AS (
-            SELECT symbol, company_name
-            FROM (
-                SELECT symbol, company_name,
-                    ROW_NUMBER() OVER (PARTITION BY symbol ORDER BY filing_date DESC) AS rn
-                FROM {_tbl('stock_sec_filing')}
-            ) x
-            WHERE rn = 1
-        ),
-        price AS (
-            SELECT symbol, close AS last_close, report_date AS price_date
-            FROM (
-                SELECT symbol, close, report_date,
-                    ROW_NUMBER() OVER (PARTITION BY symbol ORDER BY report_date DESC) AS rn
-                FROM {_tbl('stock_prices')}
-            ) x
-            WHERE rn = 1
-        ),
-        mom AS (
-            SELECT
-                curr.symbol,
-                ROUND((curr.close - prev.close) / NULLIF(prev.close, 0) * 100, 2) AS price_momentum
-            FROM (
-                SELECT symbol, close,
-                    ROW_NUMBER() OVER (PARTITION BY symbol ORDER BY report_date DESC) AS rn
-                FROM {_tbl('stock_prices')}
-            ) curr
-            LEFT JOIN (
-                SELECT symbol, close,
-                    ROW_NUMBER() OVER (
-                        PARTITION BY symbol
-                        ORDER BY report_date DESC
-                    ) AS rn
-                FROM {_tbl('stock_prices')}
-                WHERE report_date <= DATE_SUB(CURRENT_DATE(), 365)
-            ) prev ON curr.symbol = prev.symbol AND prev.rn = 1
-            WHERE curr.rn = 1
-        ),
-        vol AS (
-            SELECT symbol,
-                ROUND(AVG((high - low) / NULLIF(close, 0)) * 100, 2) AS volatility
-            FROM {_tbl('stock_prices')}
-            WHERE report_date >= DATE_SUB(CURRENT_DATE(), 90)
-            GROUP BY symbol
-        ),
-        div AS (
-            SELECT DISTINCT symbol, 1 AS pays_dividends
-            FROM {_tbl('stock_dividend_events')}
-            WHERE report_date >= DATE_SUB(CURRENT_DATE(), 730)
-              AND amount > 0
-        ),
-        eps AS (
-            SELECT symbol, tailing_eps
-            FROM (
-                SELECT symbol, tailing_eps,
-                    ROW_NUMBER() OVER (PARTITION BY symbol ORDER BY report_date DESC) AS rn
-                FROM {_tbl('stock_tailing_eps')}
-            ) x
-            WHERE rn = 1
-        ),
-        base AS (
-            SELECT
-                p.symbol, p.sector, p.industry,
-                COALESCE(n.company_name, p.symbol) AS company_name,
-                pr.last_close, pr.price_date,
-                m.price_momentum,
-                v.volatility,
-                COALESCE(d.pays_dividends, 0) AS pays_dividends,
-                e.tailing_eps
-            FROM prof p
-            INNER JOIN price pr ON p.symbol = pr.symbol
-            LEFT JOIN mom   m  ON p.symbol = m.symbol
-            LEFT JOIN vol   v  ON p.symbol = v.symbol
-            LEFT JOIN div   d  ON p.symbol = d.symbol
-            LEFT JOIN eps   e  ON p.symbol = e.symbol
-            LEFT JOIN names n  ON p.symbol = n.symbol
-        )
-        SELECT *
-        FROM base
-        WHERE {where_sql}
-        ORDER BY price_momentum DESC NULLS LAST
-        LIMIT {lim}
-    """
-    return run_sql_query(sql, "screener")
+        base = base[base["pays_dividends"] == 1]
+    
+    return base.sort_values("price_momentum", ascending=False, na_position="last").head(lim).reset_index(drop=True)
 
 
-@st.cache_data(ttl=900)
+@st.cache_data(ttl=CACHE_TTL_LONG)
 def load_statement_highlights(limit_symbols: int = 30) -> pd.DataFrame:
+    """Load revenue data for top symbols."""
     lim = max(1, min(int(limit_symbols), 200))
-    sql = f"""
-        SELECT symbol, item_name, item_value, report_date, period_type
-        FROM (
-            SELECT symbol, item_name, item_value, report_date, period_type,
-                ROW_NUMBER() OVER (PARTITION BY symbol ORDER BY report_date DESC) AS rn
-            FROM {_tbl('stock_statement')}
-            WHERE LOWER(item_name) LIKE '%total revenue%'
-              AND finance_type = 'income_statement'
-              AND period_type = 'annual'
-        ) x
-        WHERE rn = 1
-        ORDER BY item_value DESC NULLS LAST
-        LIMIT {lim}
-    """
-    df = run_sql_query(sql, "statement_highlights")
-    if not df.empty and "report_date" in df.columns:
-        df["report_date"] = pd.to_datetime(df["report_date"], errors="coerce")
-    if not df.empty and "item_value" in df.columns:
-        df["item_value"] = pd.to_numeric(df["item_value"], errors="coerce")
-    return df
+    stmt_list = []
+    
+    for symbol in DEFAULT_TICKERS:
+        try:
+            ticker = yf.Ticker(symbol)
+            fin = ticker.financials
+            if fin is not None and not fin.empty:
+                rev_rows = [idx for idx in fin.index if "revenue" in str(idx).lower()]
+                if rev_rows:
+                    rev_data = fin.loc[rev_rows[0]]
+                    if not rev_data.empty:
+                        latest_date = rev_data.index[0]
+                        latest_value = rev_data.iloc[0]
+                        stmt_list.append({
+                            "symbol": symbol,
+                            "item_name": "Total Revenue",
+                            "item_value": float(latest_value),
+                            "report_date": pd.Timestamp(latest_date),
+                            "period_type": "annual",
+                        })
+        except Exception:
+            continue
+    
+    if not stmt_list:
+        return pd.DataFrame()
+    
+    df = pd.DataFrame(stmt_list)
+    df = df.sort_values("item_value", ascending=False, na_position="last").head(lim)
+    df["report_date"] = pd.to_datetime(df["report_date"], errors="coerce")
+    df["item_value"] = pd.to_numeric(df["item_value"], errors="coerce")
+    
+    return df.reset_index(drop=True)
 
 
-
-"""
-This function powers the new 5_Stock_Screener.py page.
-"""
-@st.cache_data(ttl=300)
+@st.cache_data(ttl=CACHE_TTL_SHORT)
 def load_screener_stocks(limit: int = 2000) -> pd.DataFrame:
-    """
-    Load all stocks with screening metrics for the Stock Screener page.
- 
-    Pulls from the same real Delta tables used throughout the rest of the app:
-        stock_profile, stock_prices, stock_sec_filing,
-        stock_dividend_events, stock_tailing_eps, stock_statement
- 
-    Returns columns:
-        symbol, company_name, sector, industry,
-        last_close, price_momentum, volatility,
-        pays_dividends, tailing_eps, revenue_growth
-    """
+    """Load all stocks with screening metrics for Stock Screener page."""
     lim = max(1, min(int(limit), 5000))
-    sql = f"""
-        WITH prof AS (
-            SELECT symbol, sector, industry
-            FROM (
-                SELECT symbol, sector, industry,
-                    ROW_NUMBER() OVER (PARTITION BY symbol ORDER BY report_date DESC) AS rn
-                FROM {_tbl('stock_profile')}
-            ) t
-            WHERE rn = 1
-        ),
-        names AS (
-            SELECT symbol, company_name
-            FROM (
-                SELECT symbol, company_name,
-                    ROW_NUMBER() OVER (PARTITION BY symbol ORDER BY filing_date DESC) AS rn
-                FROM {_tbl('stock_sec_filing')}
-            ) x
-            WHERE rn = 1
-        ),
-        price AS (
-            SELECT symbol, close AS last_close
-            FROM (
-                SELECT symbol, close,
-                    ROW_NUMBER() OVER (PARTITION BY symbol ORDER BY report_date DESC) AS rn
-                FROM {_tbl('stock_prices')}
-            ) x
-            WHERE rn = 1
-        ),
-        mom AS (
-            SELECT
-                curr.symbol,
-                ROUND((curr.close - prev.close) / NULLIF(prev.close, 0) * 100, 2) AS price_momentum
-            FROM (
-                SELECT symbol, close,
-                    ROW_NUMBER() OVER (PARTITION BY symbol ORDER BY report_date DESC) AS rn
-                FROM {_tbl('stock_prices')}
-            ) curr
-            LEFT JOIN (
-                SELECT symbol, close,
-                    ROW_NUMBER() OVER (
-                        PARTITION BY symbol
-                        ORDER BY ABS(DATEDIFF(report_date, DATE_SUB(CURRENT_DATE(), 365)))
-                    ) AS rn
-                FROM {_tbl('stock_prices')}
-            ) prev ON curr.symbol = prev.symbol AND prev.rn = 1
-            WHERE curr.rn = 1
-        ),
-        vol AS (
-            SELECT symbol,
-                ROUND(AVG((high - low) / NULLIF(close, 0)) * 100, 2) AS volatility
-            FROM {_tbl('stock_prices')}
-            WHERE report_date >= DATE_SUB(CURRENT_DATE(), 90)
-            GROUP BY symbol
-        ),
-        div AS (
-            SELECT DISTINCT symbol, 1 AS pays_dividends
-            FROM {_tbl('stock_dividend_events')}
-            WHERE report_date >= DATE_SUB(CURRENT_DATE(), 730)
-              AND amount > 0
-        ),
-        eps AS (
-            SELECT symbol, tailing_eps
-            FROM (
-                SELECT symbol, tailing_eps,
-                    ROW_NUMBER() OVER (PARTITION BY symbol ORDER BY report_date DESC) AS rn
-                FROM {_tbl('stock_tailing_eps')}
-            ) x
-            WHERE rn = 1
-        ),
-        rev AS (
-            SELECT
-                curr.symbol,
-                ROUND(
-                    (curr.item_value - prev.item_value) / NULLIF(ABS(prev.item_value), 0) * 100,
-                    2
-                ) AS revenue_growth
-            FROM (
-                SELECT symbol, item_value,
-                    ROW_NUMBER() OVER (PARTITION BY symbol ORDER BY report_date DESC) AS rn
-                FROM {_tbl('stock_statement')}
-                WHERE LOWER(item_name) LIKE '%total revenue%'
-                  AND finance_type = 'income_statement'
-                  AND period_type  = 'annual'
-            ) curr
-            LEFT JOIN (
-                SELECT symbol, item_value,
-                    ROW_NUMBER() OVER (PARTITION BY symbol ORDER BY report_date DESC) AS rn
-                FROM {_tbl('stock_statement')}
-                WHERE LOWER(item_name) LIKE '%total revenue%'
-                  AND finance_type = 'income_statement'
-                  AND period_type  = 'annual'
-            ) prev ON curr.symbol = prev.symbol AND prev.rn = 2
-            WHERE curr.rn = 1
-        )
-        SELECT
-            p.symbol,
-            COALESCE(n.company_name, p.symbol) AS company_name,
-            p.sector,
-            p.industry,
-            pr.last_close,
-            m.price_momentum,
-            v.volatility,
-            COALESCE(d.pays_dividends, 0)       AS pays_dividends,
-            e.tailing_eps,
-            r.revenue_growth
-        FROM   prof  p
-        INNER  JOIN price pr ON p.symbol = pr.symbol
-        LEFT   JOIN mom   m  ON p.symbol = m.symbol
-        LEFT   JOIN vol   v  ON p.symbol = v.symbol
-        LEFT   JOIN div   d  ON p.symbol = d.symbol
-        LEFT   JOIN eps   e  ON p.symbol = e.symbol
-        LEFT   JOIN rev   r  ON p.symbol = r.symbol
-        LEFT   JOIN names n  ON p.symbol = n.symbol
-        ORDER  BY m.price_momentum DESC NULLS LAST
-        LIMIT  {lim}
-    """
-    w = WorkspaceClient()                        # same as every other load_* fn
-    return _run_query(w, sql, "screener_stocks") # correct 3-arg call
+    
+    profile = load_homepage_data()
+    metrics = load_stock_metrics()
+    
+    if profile.empty or metrics.empty:
+        return pd.DataFrame()
+    
+    base = profile.merge(metrics, on="symbol", how="left")
+    
+    return base.sort_values("price_momentum", ascending=False, na_position="last").head(lim).reset_index(drop=True)

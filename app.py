@@ -15,15 +15,12 @@ import streamlit as st
 import pandas as pd
 
 from investiq_data import (
-    get_sql_warehouse_id,
-    is_databricks_auth_failure,
     load_homepage_data,
     load_latest_price_date,
     load_price_history,
     load_price_snapshot,
     load_stock_metrics,
     prepare_merged_universe,
-    service_principal_oauth_incomplete,
 )
 from llm_chat import (
     get_gemini_api_key,
@@ -313,70 +310,16 @@ if "ml_open" not in st.session_state:
 # ---------------------------------------------------------
 # LOAD DATA
 # ---------------------------------------------------------
-def _databricks_auth_error_message() -> None:
-    st.error("Databricks authentication failed.")
-    st.markdown(
-        """
-**Run this app locally:** use the same workspace where your Delta tables live.
-
-If you see **`invalid_client` / Client authentication failed** after setting a secret, the **client ID and secret do not match** (wrong principal, rotated secret, or copy/paste with spaces). Regenerate the OAuth secret on that service principal in Databricks, update `.env`, restart Streamlit. Do not wrap the secret in quotes unless it contains special characters your shell requires.
-
-1. **Service principal (recommended):** In Databricks → **Service principals**
-   → your principal → copy **Application ID** and **Generate OAuth secret**
-   (secret is shown once). In `.env`:
-
-   `DATABRICKS_HOST` — `https://dbc-xxxx.cloud.databricks.com`  
-   `DATABRICKS_CLIENT_ID` — UUID  
-   `DATABRICKS_CLIENT_SECRET` — the secret  
-
-   Do **not** set `DATABRICKS_TOKEN` for this flow. The principal **does not
-   inherit your user access** — grant it **USE** on the SQL warehouse and
-   **SELECT** on `team_tech_innovators.default.*` (or ask your admin).
-
-2. **Interactive CLI (your user):** `databricks auth login --host https://...`
-   then set `DATABRICKS_CONFIG_PROFILE` in `.env`. Comment out
-   `DATABRICKS_CLIENT_*` / `DATABRICKS_TOKEN` if you use this path. If you see
-   "refresh token is invalid", log in again (add `--profile` if the error names one).
-
-3. **PAT:** only if your workspace still allows it — [PAT docs](https://docs.databricks.com/en/dev-tools/auth.html#databricks-personal-access-tokens).
-   `DATABRICKS_HOST` + `DATABRICKS_TOKEN` (`dapi…`). Do not mix with service-principal env vars.
-
-4. **Help:** ask Databricks Genie how to authenticate from Python with a service
-   principal's client ID and secret, and which permissions the principal needs
-   for SQL warehouses.
-
-**Databricks Apps:** the platform usually injects `DATABRICKS_CLIENT_*` and host;
-still grant the principal warehouse and catalog access.
-
-More: [Unified authentication](https://docs.databricks.com/en/dev-tools/auth.html#databricks-client-unified-authentication).
-        """
-    )
-
-
 try:
-    if service_principal_oauth_incomplete():
-        st.error(
-            "Databricks service principal: `DATABRICKS_CLIENT_SECRET` is missing or empty."
-        )
-        st.markdown(
-            """
-Your `.env` sets **`DATABRICKS_CLIENT_ID`** (the UUID for the principal) but not the matching **client secret**. OAuth sign-in will fail until both are set — **unless** you use a **CLI profile**: set `DATABRICKS_CONFIG_PROFILE` and run `databricks auth login` (recommended for local dev; the app will ignore incomplete OAuth when a profile is present).
-
-1. In the Databricks workspace: **Settings → Identity and access → Service principals** → select the principal → **Generate secret** (or ask your admin).  
-2. Add to `.env`: `DATABRICKS_CLIENT_SECRET=` followed by the real secret (no spaces around `=`).  
-3. Restart Streamlit — **or** keep using **`DATABRICKS_CONFIG_PROFILE`** + CLI login and **comment out** `DATABRICKS_CLIENT_ID` / `DATABRICKS_CLIENT_SECRET`.
-            """
-        )
-        st.stop()
-    df = load_homepage_data()
-    latest_prices = load_price_snapshot()
+    with st.spinner("Loading stock data from yfinance..."):
+        df = load_homepage_data()
+        latest_prices = load_price_snapshot()
     with st.spinner("Loading stock metrics for smarter recommendations..."):
         stock_metrics = load_stock_metrics()
 except Exception as exc:
-    if is_databricks_auth_failure(exc):
-        _databricks_auth_error_message()
-        st.stop()
-    raise
+    st.error(f"Error loading market data: {exc}")
+    st.info("Please ensure you have a stable internet connection for yfinance data fetching.")
+    st.stop()
 
 # ---------------------------------------------------------
 # PAGE STYLES

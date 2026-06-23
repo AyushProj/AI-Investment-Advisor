@@ -9,10 +9,7 @@ except ImportError:
 
 import streamlit as st
 import pandas as pd
-from investiq_data import SQL_WAREHOUSE_ID
-from databricks.sdk import WorkspaceClient
-from databricks.sdk.service.sql import StatementState
-import time
+from investiq_data import load_homepage_data
 
 # ---------------------------------------------------------
 # PAGE CONFIG
@@ -23,139 +20,13 @@ st.set_page_config(
     layout="wide"
 )
 
-WAREHOUSE_ID = SQL_WAREHOUSE_ID
-CHUNK_SIZE = 1000
-
-# ---------------------------------------------------------
-# HELPER: paginated INLINE query → DataFrame
-# ---------------------------------------------------------
-def _run_query(w: WorkspaceClient, sql: str, label: str) -> pd.DataFrame:
-    all_rows = []
-    columns = None
-    offset = 0
-
-    try:
-        while True:
-            paginated_sql = f"SELECT * FROM ({sql}) _q LIMIT {CHUNK_SIZE} OFFSET {offset}"
-
-            resp = w.statement_execution.execute_statement(
-                warehouse_id=WAREHOUSE_ID,
-                statement=paginated_sql,
-                wait_timeout="30s",
-            )
-
-            while resp.status.state in [StatementState.PENDING, StatementState.RUNNING]:
-                time.sleep(1)
-                resp = w.statement_execution.get_statement(resp.statement_id)
-
-            if resp.status.state != StatementState.SUCCEEDED:
-                st.error(
-                    f"Query '{label}' failed at offset {offset} "
-                    f"with state: {resp.status.state}. "
-                    f"Error: {getattr(resp.status, 'error', 'unknown')}"
-                )
-                break
-
-            if columns is None:
-                schema = None
-                if resp.manifest is not None and hasattr(resp.manifest, "schema") and resp.manifest.schema is not None:
-                    schema = resp.manifest.schema
-                elif hasattr(resp.result, "schema") and resp.result.schema is not None:
-                    schema = resp.result.schema
-
-                if schema is None:
-                    st.error(f"Query '{label}': could not locate schema in response.")
-                    return pd.DataFrame()
-
-                columns = [c.name for c in schema.columns]
-
-            if resp.result is None or not resp.result.data_array:
-                break
-
-            chunk = resp.result.data_array
-            all_rows.extend(chunk)
-
-            if len(chunk) < CHUNK_SIZE:
-                break
-
-            offset += CHUNK_SIZE
-
-        if not all_rows:
-            return pd.DataFrame(columns=columns) if columns else pd.DataFrame()
-
-        return pd.DataFrame(all_rows, columns=columns)
-
-    except Exception as exc:
-        st.error(f"Exception running query '{label}': {exc}")
-        return pd.DataFrame()
-
-
 # ---------------------------------------------------------
 # DATA LOADER
 # ---------------------------------------------------------
 @st.cache_data
 def load_all_stocks() -> pd.DataFrame:
-    w = WorkspaceClient()
-
-    query_profile = """
-        SELECT symbol, sector, industry, long_business_summary, report_date
-        FROM team_tech_innovators.default.stock_profile
-    """
-    query_sec = """
-        SELECT symbol, company_name, filing_date
-        FROM (
-            SELECT
-                symbol,
-                company_name,
-                filing_date,
-                ROW_NUMBER() OVER (PARTITION BY symbol ORDER BY filing_date DESC) AS rn
-            FROM team_tech_innovators.default.stock_sec_filing
-        ) ranked
-        WHERE rn = 1
-    """
-
-    profile_df = _run_query(w, query_profile, "stock_profile")
-    if profile_df.empty:
-        return pd.DataFrame()
-
-    sec_df = _run_query(w, query_sec, "stock_sec_filing")
-
-    # Clean profile
-    profile_df["symbol"] = profile_df["symbol"].astype(str).str.strip().str.upper()
-    profile_df["sector"] = profile_df["sector"].astype(str).str.strip()
-    profile_df["industry"] = profile_df["industry"].astype(str).str.strip()
-    profile_df["report_date"] = pd.to_datetime(profile_df["report_date"], errors="coerce")
-    profile_df = profile_df.dropna(subset=["symbol", "sector"])
-    profile_df = (
-        profile_df
-        .sort_values(["symbol", "report_date"])
-        .drop_duplicates(subset=["symbol"], keep="last")
-    )
-
-    if sec_df.empty:
-        profile_df["company_name"] = profile_df["symbol"]
-        return profile_df[["symbol", "company_name", "sector", "industry", "long_business_summary"]].sort_values(
-            ["sector", "company_name"]
-        ).reset_index(drop=True)
-
-    # Clean SEC
-    sec_df["symbol"] = sec_df["symbol"].astype(str).str.strip().str.upper()
-    sec_df["company_name"] = sec_df["company_name"].astype(str).str.strip()
-    sec_df["filing_date"] = pd.to_datetime(sec_df["filing_date"], errors="coerce")
-    sec_df = sec_df.dropna(subset=["symbol", "company_name"])
-    sec_df = sec_df[sec_df["company_name"] != ""]
-    sec_df = sec_df[sec_df["company_name"].str.lower() != "nan"]
-    sec_df = (
-        sec_df
-        .sort_values(["symbol", "filing_date"])
-        .drop_duplicates(subset=["symbol"], keep="last")
-    )
-
-    df = profile_df.merge(sec_df[["symbol", "company_name"]], on="symbol", how="left")
-    df["company_name"] = df["company_name"].fillna(df["symbol"])
-    return df[["symbol", "company_name", "sector", "industry", "long_business_summary"]].sort_values(
-        ["sector", "company_name"]
-    ).reset_index(drop=True)
+    """Load all stocks from yfinance via investiq_data."""
+    return load_homepage_data()
 
 
 # ---------------------------------------------------------

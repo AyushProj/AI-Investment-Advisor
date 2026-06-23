@@ -18,7 +18,6 @@ except ImportError:
 
 from investiq_data import (
     company_label_options,
-    is_databricks_auth_failure,
     load_homepage_data,
     load_price_snapshot,
     load_stock_metrics,
@@ -44,15 +43,19 @@ if "cmp_ml_results" not in st.session_state:
     st.session_state.cmp_ml_results = None
 
 
-def _auth_error_ui() -> None:
-    st.error("Databricks authentication failed.")
-    st.markdown(
-        """
-If the CLI says the **refresh token is invalid**, run `databricks auth login` again
-(with `--profile …` if the error names one). Alternatively set `DATABRICKS_HOST` +
-`DATABRICKS_TOKEN` in `.env` and restart Streamlit.
-        """
-    )
+
+def _load_data_with_error_handling():
+    """Load data with generic error handling."""
+    try:
+        df = load_homepage_data()
+        latest_prices = load_price_snapshot()
+        with st.spinner("Loading metrics…"):
+            stock_metrics = load_stock_metrics()
+        return df, latest_prices, stock_metrics
+    except Exception as exc:
+        st.error(f"Error loading data: {exc}")
+        st.info("Please ensure you have a stable internet connection for yfinance data fetching.")
+        st.stop()
 
 
 st.markdown("""
@@ -142,16 +145,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ── Load data ─────────────────────────────────────────────────────────────────
-try:
-    df = load_homepage_data()
-    latest_prices = load_price_snapshot()
-    with st.spinner("Loading metrics…"):
-        stock_metrics = load_stock_metrics()
-except Exception as exc:
-    if is_databricks_auth_failure(exc):
-        _auth_error_ui()
-        st.stop()
-    raise
+df, latest_prices, stock_metrics = _load_data_with_error_handling()
 
 compare_options, label_to_symbol = company_label_options(df)
 

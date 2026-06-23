@@ -1,8 +1,5 @@
 """
-News headlines + VADER sentiment — primary source from Databricks (Statement API).
-
-Uses the same ``WorkspaceClient`` auth as ``investiq_data`` (OAuth on Databricks Apps).
-Falls back to Yahoo Finance if the warehouse view is missing or the query fails.
+News headlines + VADER sentiment — fetched from Yahoo Finance (yfinance).
 """
 
 from __future__ import annotations
@@ -85,57 +82,13 @@ def _extract_news_url(val: object) -> str:
     return ""
 
 
-# ── Primary: Databricks SQL (SDK / OAuth — same path as investiq_data) ────
+# ── Primary: Yahoo Finance (yfinance) ──────────────────────────────────────
 
 def _fetch_from_databricks(symbol: str, limit: int) -> pd.DataFrame | None:
     """
-    Pull news rows from the configured ``INVESTIQ_STOCK_NEWS_FQN`` view.
-    Expected columns: title, summary, published, source, url
-    Returns None if auth or SQL fails (caller may fall back to Yahoo).
+    Databricks data source is no longer used. Always returns None to use yfinance fallback.
     """
-    if not _STOCK_NEWS_FQN or not _FQN_SAFE.match(_STOCK_NEWS_FQN):
-        return None
-
-    from investiq_data import run_sql_query_optional
-
-    sym = "".join(c for c in symbol if c.isalnum() or c in "-._")
-    if not sym:
-        return None
-    sym_esc = sym.replace("'", "''")
-    lim = max(1, min(int(limit), 50))
-    sql = f"""
-        SELECT title, summary, published, source, url
-        FROM {_STOCK_NEWS_FQN}
-        WHERE UPPER(symbol) = UPPER('{sym_esc}')
-        ORDER BY published DESC
-        LIMIT {lim}
-    """
-    df = run_sql_query_optional(sql.strip(), label="stock_news")
-    if df is None:
-        return None
-
-    records = []
-    for _, row in df.iterrows():
-        title = str(row.get("title") or "").strip()
-        summary = str(row.get("summary") or "").strip()
-        if not title:
-            continue
-        text = f"{title}. {summary}".strip()
-        compound, label = _score_sentiment(text)
-        records.append(
-            {
-                "published": _fmt_pub(str(row.get("published") or "")),
-                "sentiment": compound,
-                "label": label,
-                "title": title,
-                "source": str(row.get("source") or "—"),
-                "url": str(row.get("url") or ""),
-            }
-        )
-    return pd.DataFrame(records)
-
-
-# ── Fallback: Yahoo Finance ────────────────────────────────────────────────
+    return None
 
 def _flatten_news_item(item: dict) -> dict:
     """Normalize yfinance news row (nested `content` dict)."""
@@ -206,9 +159,7 @@ def fetch_yahoo_news_with_sentiment(
     """
     Return a DataFrame of recent news headlines with VADER sentiment scores.
 
-    Data source priority:
-      1. Databricks view (``INVESTIQ_STOCK_NEWS_FQN``, default ``investiq.stock_news``)
-      2. Yahoo Finance via yfinance (fallback)
+    Data source: Yahoo Finance via yfinance
     """
     sym = str(symbol or "").strip().upper()
     if not sym:
