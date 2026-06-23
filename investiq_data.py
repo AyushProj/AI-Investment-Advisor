@@ -218,7 +218,7 @@ def load_price_history(symbols: tuple[str, ...], lookback_days: int = 1825) -> p
     df["close"] = pd.to_numeric(df["close"], errors="coerce")
     df = df.dropna(subset=["symbol", "report_date", "close"])
     
-    cutoff = pd.Timestamp.today() - pd.Timedelta(days=lookback_days)
+    cutoff = pd.Timestamp.utcnow() - pd.Timedelta(days=lookback_days)
     df = df[df["report_date"] >= cutoff]
     
     return df.sort_values(["symbol", "report_date"]).reset_index(drop=True)
@@ -242,7 +242,7 @@ def load_stock_metrics() -> pd.DataFrame:
             latest_close = hist.iloc[-1]["close"]
             
             # Price momentum (1Y)
-            year_ago = pd.Timestamp.today() - pd.Timedelta(days=365)
+            year_ago = pd.Timestamp.utcnow() - pd.Timedelta(days=365)
             year_ago_data = hist[hist["report_date"] <= year_ago]
             price_momentum = None
             if not year_ago_data.empty:
@@ -251,7 +251,7 @@ def load_stock_metrics() -> pd.DataFrame:
                     price_momentum = round((latest_close - year_ago_close) / year_ago_close * 100, 2)
             
             # Volatility (90D)
-            recent = hist[hist["report_date"] >= pd.Timestamp.today() - pd.Timedelta(days=90)]
+            recent = hist[hist["report_date"] >= pd.Timestamp.utcnow() - pd.Timedelta(days=90)]
             volatility = None
             if not recent.empty and "high" in recent.columns and "low" in recent.columns:
                 volatility = round(
