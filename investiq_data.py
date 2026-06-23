@@ -18,6 +18,7 @@ Features
 from __future__ import annotations
 
 import os
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -57,15 +58,38 @@ DEFAULT_TICKERS: list[str] = [
 
 
 # ---------------------------------------------------------------------------
+# Retry logic with exponential backoff
+# ---------------------------------------------------------------------------
+
+def _retry_with_backoff(func, symbol: str, max_retries: int = 3, initial_delay: float = 0.5) -> dict | pd.DataFrame:
+    """Retry a function with exponential backoff for rate limiting."""
+    for attempt in range(max_retries):
+        try:
+            return func(symbol)
+        except Exception as exc:
+            if "Too Many Requests" in str(exc) or "429" in str(exc):
+                if attempt < max_retries - 1:
+                    delay = initial_delay * (2 ** attempt)  # Exponential backoff: 0.5s, 1s, 2s
+                    time.sleep(delay)
+                    continue
+            # Last attempt failed or non-retryable error
+            return {} if isinstance(func(symbol), dict) else pd.DataFrame()
+    return {} if isinstance(func(symbol), dict) else pd.DataFrame()
+
+
+# ---------------------------------------------------------------------------
 # Data Fetching – Direct yfinance API
 # ---------------------------------------------------------------------------
 
 @st.cache_data(ttl=CACHE_TTL_SHORT)
 def _fetch_ticker_info(symbol: str) -> dict:
-    """Fetch ticker info from yfinance with error handling."""
-    try:
+    """Fetch ticker info from yfinance with retry logic."""
+    def fetch():
         ticker = yf.Ticker(symbol)
         return ticker.info or {}
+    
+    try:
+        return _retry_with_backoff(fetch, symbol)
     except Exception as exc:
         st.warning(f"Could not fetch info for {symbol}: {exc}")
         return {}
@@ -109,9 +133,9 @@ def _fetch_dividends(symbol: str) -> pd.DataFrame:
 
 @st.cache_data(ttl=CACHE_TTL_MEDIUM)
 def _fetch_batch_tickers(symbols: tuple[str, ...]) -> pd.DataFrame:
-    """Fetch basic info for multiple tickers at once."""
+    """Fetch basic info for multiple tickers at once with delays to avoid rate limiting."""
     records = []
-    for symbol in symbols:
+    for idx, symbol in enumerate(symbols):
         info = _fetch_ticker_info(symbol)
         if info:
             records.append({
@@ -122,6 +146,9 @@ def _fetch_batch_tickers(symbols: tuple[str, ...]) -> pd.DataFrame:
                 "company_name": info.get("longName") or info.get("shortName") or symbol.upper(),
                 "report_date": pd.Timestamp.today().normalize().date(),
             })
+        # Add delay between requests to avoid rate limiting (0.1s per request)
+        if idx < len(symbols) - 1:
+            time.sleep(0.1)
     
     if not records:
         return pd.DataFrame()
