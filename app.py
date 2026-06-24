@@ -1,5 +1,8 @@
 import html
+import math
 import os
+import threading
+import time
 from pathlib import Path
 import groq
 
@@ -308,18 +311,81 @@ if "ml_open" not in st.session_state:
     st.session_state.ml_open = {}  # symbol -> bool  ← NEW
 
 # ---------------------------------------------------------
-# LOAD DATA
+# LOAD DATA  (animated progress bar instead of a plain spinner)
 # ---------------------------------------------------------
-try:
-    with st.spinner("Loading stock data from yfinance..."):
-        df = load_homepage_data()
-        latest_prices = load_price_snapshot()
-    with st.spinner("Loading stock metrics for smarter recommendations..."):
-        stock_metrics = load_stock_metrics()
-except Exception as exc:
-    st.error(f"Error loading market data: {exc}")
+# The three loaders below are unchanged from before — same functions, same
+# call order, same return values. We only change *how* the wait is shown:
+# instead of "Loading stock data from yfinance... / Running load_homepage_data()",
+# we run the loaders on a background thread and drive a progress bar + rotating
+# status text on the main thread while we wait for them to finish.
+
+def _run_homepage_loaders(result: dict, error: dict) -> None:
+    """Runs the existing loader functions, untouched, on a background thread."""
+    try:
+        result["df"] = load_homepage_data()
+        result["latest_prices"] = load_price_snapshot()
+        result["stock_metrics"] = load_stock_metrics()
+    except Exception as exc:  # noqa: BLE001 - surfaced to the main thread below
+        error["exc"] = exc
+
+
+# (progress %, status message) checkpoints — purely cosmetic, mirrors the
+# real sequence of work happening inside the loader functions above.
+_LOAD_STAGES = [
+    (0.04, "🔌 Connecting to Yahoo Finance..."),
+    (0.18, "📥 Fetching live stock prices..."),
+    (0.45, "📊 Downloading historical price history..."),
+    (0.70, "🧮 Calculating momentum, volatility & EPS metrics..."),
+    (0.88, "🧠 Preparing data for AI recommendations..."),
+    (0.97, "✨ Almost there..."),
+]
+# Typical observed load time — used only to pace the progress bar so it feels
+# proportional to real elapsed time. The bar will still wait for the actual
+# loaders to finish even if this estimate is off in either direction.
+_EXPECTED_LOAD_SECONDS = 17.0
+
+_progress_bar = st.empty()
+_status_text = st.empty()
+
+_result: dict = {}
+_error: dict = {}
+_load_thread = threading.Thread(
+    target=_run_homepage_loaders, args=(_result, _error), daemon=True
+)
+_start_time = time.time()
+_load_thread.start()
+
+_stage_idx = 0
+while _load_thread.is_alive():
+    _elapsed = time.time() - _start_time
+    # Asymptotic curve: climbs quickly at first, then eases off, capped at 97%
+    # until the real data is actually ready — so the bar never lies by hitting
+    # 100% before the work is done.
+    _pct = min(0.97, 1 - math.exp(-_elapsed / (_EXPECTED_LOAD_SECONDS / 2.5)))
+    while _stage_idx < len(_LOAD_STAGES) - 1 and _pct >= _LOAD_STAGES[_stage_idx][0]:
+        _stage_idx += 1
+    _progress_bar.progress(_pct, text=f"{int(_pct * 100)}%")
+    _status_text.markdown(f"**{_LOAD_STAGES[_stage_idx][1]}**")
+    time.sleep(0.12)
+
+_load_thread.join()
+
+if "exc" in _error:
+    _progress_bar.empty()
+    _status_text.empty()
+    st.error(f"Error loading market data: {_error['exc']}")
     st.info("Please ensure you have a stable internet connection for yfinance data fetching.")
     st.stop()
+
+_progress_bar.progress(1.0, text="100%")
+_status_text.markdown("**✅ Data loaded!**")
+time.sleep(0.25)
+_progress_bar.empty()
+_status_text.empty()
+
+df = _result["df"]
+latest_prices = _result["latest_prices"]
+stock_metrics = _result["stock_metrics"]
 
 # ---------------------------------------------------------
 # PAGE STYLES
