@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import math
+import threading
+import time
 from pathlib import Path
 
 import pandas as pd
@@ -310,22 +313,80 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-try:
-    with st.spinner("Loading sector benchmarks…"):
-        sectors = load_sector_benchmarks()
-    with st.spinner("Loading movers & liquidity…"):
-        top = load_top_movers(15, losers=False)
-        bottom = load_top_movers(15, losers=True)
-        vol = load_volume_vs_average(20)
-    with st.spinner("Loading filings & dividends…"):
-        filings = load_recent_sec_filings(35)
-        divs = load_recent_dividend_events(40)
-    with st.spinner("Loading revenue highlights…"):
-        revenue = load_statement_highlights(25)
-except Exception as exc:
-    st.error(f"Error loading market data: {exc}")
+def _run_market_intel_loaders(result: dict, error: dict) -> None:
+    """Runs the existing loader functions, untouched, on a background thread."""
+    try:
+        result["sectors"] = load_sector_benchmarks()
+        result["top"] = load_top_movers(15, losers=False)
+        result["bottom"] = load_top_movers(15, losers=True)
+        result["vol"] = load_volume_vs_average(20)
+        result["filings"] = load_recent_sec_filings(35)
+        result["divs"] = load_recent_dividend_events(40)
+        result["revenue"] = load_statement_highlights(25)
+    except Exception as exc:  # noqa: BLE001 - surfaced to the main thread below
+        error["exc"] = exc
+
+
+# (progress %, status message) checkpoints — purely cosmetic, mirrors the
+# real sequence of work happening inside the loader functions above.
+_MI_LOAD_STAGES = [
+    (0.05, "📊 Loading sector benchmarks..."),
+    (0.35, "📈 Finding top movers & liquidity..."),
+    (0.65, "📰 Pulling SEC filings & dividend events..."),
+    (0.88, "💰 Loading revenue highlights..."),
+    (0.97, "✨ Almost there..."),
+]
+# Typical observed load time — used only to pace the progress bar so it feels
+# proportional to real elapsed time. The bar will still wait for the actual
+# loaders to finish even if this estimate is off in either direction.
+_MI_EXPECTED_LOAD_SECONDS = 14.0
+
+_mi_progress_bar = st.empty()
+_mi_status_text = st.empty()
+
+_mi_result: dict = {}
+_mi_error: dict = {}
+_mi_load_thread = threading.Thread(
+    target=_run_market_intel_loaders, args=(_mi_result, _mi_error), daemon=True
+)
+_mi_start_time = time.time()
+_mi_load_thread.start()
+
+_mi_stage_idx = 0
+while _mi_load_thread.is_alive():
+    _mi_elapsed = time.time() - _mi_start_time
+    # Asymptotic curve: climbs quickly at first, then eases off, capped at 97%
+    # until the real data is actually ready — so the bar never lies by hitting
+    # 100% before the work is done.
+    _mi_pct = min(0.97, 1 - math.exp(-_mi_elapsed / (_MI_EXPECTED_LOAD_SECONDS / 2.5)))
+    while _mi_stage_idx < len(_MI_LOAD_STAGES) - 1 and _mi_pct >= _MI_LOAD_STAGES[_mi_stage_idx][0]:
+        _mi_stage_idx += 1
+    _mi_progress_bar.progress(_mi_pct, text=f"{int(_mi_pct * 100)}%")
+    _mi_status_text.markdown(f"**{_MI_LOAD_STAGES[_mi_stage_idx][1]}**")
+    time.sleep(0.12)
+
+_mi_load_thread.join()
+
+if "exc" in _mi_error:
+    _mi_progress_bar.empty()
+    _mi_status_text.empty()
+    st.error(f"Error loading market data: {_mi_error['exc']}")
     st.info("Please ensure you have a stable internet connection for data fetching.")
     st.stop()
+
+_mi_progress_bar.progress(1.0, text="100%")
+_mi_status_text.markdown("**✅ Data loaded!**")
+time.sleep(0.25)
+_mi_progress_bar.empty()
+_mi_status_text.empty()
+
+sectors = _mi_result["sectors"]
+top = _mi_result["top"]
+bottom = _mi_result["bottom"]
+vol = _mi_result["vol"]
+filings = _mi_result["filings"]
+divs = _mi_result["divs"]
+revenue = _mi_result["revenue"]
 
 tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
     "Sectors",
